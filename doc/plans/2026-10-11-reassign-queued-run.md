@@ -206,43 +206,28 @@ cd server && runuser -u postgres -- env HOME=/tmp/pgtest-home TMPDIR=/tmp/pgtest
   bash -c 'cd /home/user/paperclip/server && npx vitest run <files>'
 ```
 
-- On unmodified code, the new tests fail for path (a) and path (b). The negative test passes.
-- With the fix, these suites pass:
-  - Batch 1, 6 files, 273 tests:
-    - heartbeat-reassign-queued-run
-    - issue-agent-mutation-ownership-routes
-    - heartbeat-lock-release-on-reassignment
-    - heartbeat-stale-queue-invalidation
-    - heartbeat-retry-scheduling
-    - human-directed-work
-  - Batch 2, 11 files, 468 tests:
-    - heartbeat-workspace-busy
-    - heartbeat-queued-run-claim-isolation
-    - run-dispatch adapter, use-cases and policy
-    - native task-reassignment
-    - explicit-native-continuation
-    - issue-assignee-invokability-routes
-    - issue-stale-execution-lock-routes
-    - heartbeat-dependency-scheduling
-    - heartbeat-scheduling-suppression
-- After the switch to the positive ownership list:
-  - `reassignment-ownership.test.ts`, `heartbeat-reassign-queued-run.test.ts`
-    and `issue-agent-mutation-ownership-routes.test.ts`: 3 files, 151 tests
-    passed.
-  - The fifteen files of the two batches above, rerun together on this
-    change: 15 files, 595 tests passed.
-- After the F2, F3 and native changes:
-  - `heartbeat-reassign-queued-run.test.ts`: 5 tests passed. The failed-update
-    test fails on the previous cancel-before-update ordering (the run is
-    cancelled with `issue_reassigned` although the update was rejected).
-  - `run-dispatch/adapters/postgres.test.ts`: 50 tests passed, including the
-    four evidence-marker cases.
-  - Full regression set, rerun on this change: the fifteen batch files above
-    plus `reassignment-ownership.test.ts`, `heartbeat-reassign-queued-run.test.ts`
-    and `issue-agent-mutation-ownership-routes.test.ts`. 18 files, 752 tests
-    passed.
+- `heartbeat-reassign-queued-run.test.ts` (7 tests):
+  - reassignment through the route cancels the queued `issue_assigned` run
+    and admits the new assignee's wake, with no recovery for the old one
+  - a queued run that becomes claimable during the active-run stop is
+    cancelled by the reassignment and never starts; on the previous code the
+    stop sends it through the claim path before the commit
+  - a queued run another path already started rolls the reassignment back
+    with 409
+  - a rejected update keeps the queued run; this fails on the
+    cancel-before-update ordering
+  - the queued-run gate cancels a stale legacy holder and frees the lock
+  - a native queued run is left to the gate, with no reconciliation hold and
+    with the new wake promoted (fixture)
+  - the previous assignee's `interaction_pending` wake survives
+- Full regression set on the final code: 20 files, 772 tests passed. It
+  includes the reassignment, classification, ownership-route,
+  invokability-route, stale-queue, retry, workspace-busy, claim-isolation,
+  run-dispatch, native reassignment and cancellation, terminalize-before-
+  release, dependency and scheduling suites.
 - `pnpm --filter @paperclipai/server typecheck` passes.
 - Not run: the full monorepo typecheck, `pnpm test:run` and `pnpm build`.
+- GitHub Actions do not run on this fork.
 
 ## Open Questions
 
