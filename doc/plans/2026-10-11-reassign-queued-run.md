@@ -239,6 +239,13 @@ cd server && runuser -u postgres -- env HOME=/tmp/pgtest-home TMPDIR=/tmp/pgtest
   invokability-route, stale-queue, retry, workspace-busy, claim-isolation,
   run-dispatch, native reassignment and cancellation, terminalize-before-
   release, dependency and scheduling suites.
+- After the shared pre-dispatch predicate (F3 on the transactional cancel):
+  24 files, 1262 of 1263 tests passed. The set adds the suites that use the
+  verifier: `legacy-execution-recovery`, `wake-queue/adapters/postgres`,
+  `heartbeat-process-recovery` and `disposition-repair`. The one failure,
+  `heartbeat-process-recovery` "redacts opaque environment-bound credentials
+  from Sentry diagnostics: result", also fails with the base versions of
+  every changed source file, so it is not caused by this branch.
 - `pnpm --filter @paperclipai/server typecheck` passes.
 - Not run: the full monorepo typecheck, `pnpm test:run` and `pnpm build`.
 - GitHub Actions do not run on this fork.
