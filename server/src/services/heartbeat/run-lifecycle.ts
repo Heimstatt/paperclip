@@ -1070,6 +1070,53 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     return updated;
   }
 
+  /**
+   * Cancels a queued legacy run inside the caller's transaction, with the same
+   * cancellation and bootstrap evidence as setRunStatus. Returns null when the
+   * run has left the queue. Call this last in the transaction: the legacy
+   * terminalization sets transaction-local lock and statement timeouts.
+   * The caller publishes the change with publishRunStatusChange after commit.
+   */
+  async function cancelQueuedLegacyRunInTx(
+    tx: Db,
+    runId: string,
+    input: { reason: string; errorCode: string },
+  ) {
+    const [previous] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    if (!previous || previous.status !== "queued" || previous.runtimeMode !== "legacy") return null;
+    const resultJson = cancellationResultJson(previous, "cancelled", undefined, input.errorCode, input.reason);
+    const updated = await terminalizeLegacyExecution({
+      db: tx,
+      run: previous,
+      status: "cancelled",
+      fromStatuses: ["queued"],
+      reconcileIfNeeded: true,
+      patch: {
+        finishedAt: new Date(),
+        error: input.reason,
+        errorCode: input.errorCode,
+        resultJson: !previous.startedAt && !previous.processPid
+          ? { ...previous.resultJson, ...resultJson, executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
+          : resultJson,
+      },
+    });
+    return updated ? { previous, updated } : null;
+  }
+
+  /** Publishes a committed run status change, as setRunStatus does. */
+  function publishRunStatusChange(
+    updated: typeof heartbeatRuns.$inferSelect,
+    previousStatus: string | null,
+  ) {
+    publishLiveEvent({
+      companyId: updated.companyId,
+      type: "heartbeat.run.status",
+      payload: buildHeartbeatRunStatusLiveEventPayload(updated),
+    });
+    publishRunLifecyclePluginEvent(updated);
+    emitTerminalAgentTaskRun(updated, previousStatus);
+  }
+
   async function setRunStatusIfRunning(
     runId: string,
     status: string,
@@ -2984,6 +3031,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     classifyAndPersistRunLiveness,
     setRunStatusFromLive,
     setRunStatus,
+    cancelQueuedLegacyRunInTx,
+    publishRunStatusChange,
     publishRunLifecyclePluginEventData,
     publishRunLifecyclePluginEvent,
     persistRunProcessMetadata,
