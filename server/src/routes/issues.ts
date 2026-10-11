@@ -264,7 +264,6 @@ import {
 } from "../attachment-types.js";
 import { retainBacklogHumanAssignment } from "../services/human-directed-work.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
-import { ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS } from "../services/issue-tree-control.js";
 import { shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
@@ -14254,6 +14253,26 @@ export function issueRoutes(
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
         });
+        // A queued run of the previous assignee holds the issue lock without
+        // running, so the new assignee's wake would stay parked behind it.
+        // Snapshot these before stopping the running run: that stop frees a
+        // slot and could start one of them. Mention and interaction wakes are
+        // left for their own agents to resolve.
+        const queuedRunsForReassignment = (await db
+          .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, existing.companyId),
+              eq(heartbeatRuns.agentId, existing.assigneeAgentId),
+              eq(heartbeatRuns.status, "queued"),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${existing.id}`,
+            ),
+          ))
+          .filter((queuedRun) => {
+            const wakeReason = (queuedRun.contextSnapshot as Record<string, unknown> | null)?.wakeReason;
+            return wakeReason !== "issue_comment_mentioned" && wakeReason !== "interaction_pending";
+          });
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
         if (runToStopForReassignment) {
           const cancelled = await heartbeat.cancelRun(
@@ -14277,30 +14296,7 @@ export function issueRoutes(
           }
           interruptedRunId = cancelled.id;
         }
-        // A queued run of the previous assignee holds the issue lock without
-        // running, so the new assignee's wake would stay parked behind it.
-        // Cancel only that agent's ownership runs; mention and interaction
-        // wakes are left for their own agents to resolve.
-        const queuedRunsForReassignment = await db
-          .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
-          .from(heartbeatRuns)
-          .where(
-            and(
-              eq(heartbeatRuns.companyId, existing.companyId),
-              eq(heartbeatRuns.agentId, existing.assigneeAgentId),
-              eq(heartbeatRuns.status, "queued"),
-              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${existing.id}`,
-            ),
-          );
         for (const queuedRun of queuedRunsForReassignment) {
-          const wakeReason = (queuedRun.contextSnapshot as Record<string, unknown> | null)?.wakeReason;
-          if (
-            typeof wakeReason === "string" &&
-            (wakeReason === "interaction_pending" ||
-              ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has(wakeReason))
-          ) {
-            continue;
-          }
           const cancelledQueued = await heartbeat.cancelRun(
             queuedRun.id,
             "Cancelled before issue reassignment",
@@ -14313,7 +14309,8 @@ export function issueRoutes(
               eventPayload: { issueId: existing.id },
             },
           );
-          if (!cancelledQueued || cancelledQueued.status !== "cancelled") {
+          // A run that finished on its own in the meantime needs no stop.
+          if (!cancelledQueued || ["queued", "running", "scheduled_retry"].includes(cancelledQueued.status)) {
             throw conflict(
               "The queued agent run could not be cancelled before reassignment",
               {
