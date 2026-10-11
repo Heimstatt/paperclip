@@ -1108,6 +1108,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
       if (staleness.outcome === "cancelled" || staleness.outcome === "deferred") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        if (staleness.outcome === "cancelled" && staleness.errorCode === "issue_assignee_changed") {
+          // The gate cleared the issue lock but does not drain the new
+          // assignee's wakes parked behind the old holder. This runs under the
+          // agent start lock, so recovery stays off and effects are deferred.
+          await releaseIssueExecutionAndPromote({ id: run.id, companyId: run.companyId }, {
+            suppressImmediateRecovery: true, deferredPostCommitEffects,
+          });
+        }
         logger.info(
           {
             runId: run.id,

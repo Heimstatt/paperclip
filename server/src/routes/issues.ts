@@ -264,6 +264,7 @@ import {
 } from "../attachment-types.js";
 import { retainBacklogHumanAssignment } from "../services/human-directed-work.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { classifyRunForReassignment } from "../services/reassignment-ownership.js";
 import { shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
@@ -7246,6 +7247,27 @@ export function issueRoutes(
         },
       );
     }
+  }
+
+  /**
+   * Retries that overwrite the wake reason own the issue exactly when their
+   * source run did, so follow the retry chain back to a classified reason.
+   */
+  async function isOwnershipRunForReassignment(
+    companyId: string,
+    run: { contextSnapshot: unknown; retryOfRunId: string | null },
+  ) {
+    let current: { contextSnapshot: unknown; retryOfRunId: string | null } | undefined = run;
+    for (let hop = 0; current && hop < 5; hop += 1) {
+      const ownership = classifyRunForReassignment(current.contextSnapshot as Record<string, unknown> | null);
+      if (ownership !== "follow_source") return ownership === "ownership";
+      if (!current.retryOfRunId) return false;
+      [current] = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot, retryOfRunId: heartbeatRuns.retryOfRunId })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, current.retryOfRunId), eq(heartbeatRuns.companyId, companyId)));
+    }
+    return false;
   }
 
   async function resolveActiveIssueRun(issue: {
@@ -14247,14 +14269,75 @@ export function issueRoutes(
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
+      // Queued ownership runs of the previous assignee. They are cancelled in
+      // the same transaction as the reassignment (see below).
+      const queuedRunsForReassignment: { id: string }[] = [];
+      let cancelledReassignmentRuns: Awaited<ReturnType<typeof heartbeat.cancelQueuedRunsInTx>> = [];
+      // While the reassignment is in flight, stopping the previous assignee's
+      // run must not start that agent's queue: a selected queued run would be
+      // claimed under the old assignment. Starts resume once the response ends.
+      const reassignmentQueueFence: Parameters<typeof heartbeat.resumeAfterDeferredCancellation>[1] = [];
+      let fencedQueueAgentId: string | null = null;
+      const holdAgentQueueUntilResponseEnds = (agentId: string) => {
+        if (fencedQueueAgentId) return;
+        fencedQueueAgentId = agentId;
+        res.once("close", () => {
+          void heartbeat
+            .resumeAfterDeferredCancellation(agentId, reassignmentQueueFence.splice(0))
+            .catch((err) => {
+              logger.warn({ err, agentId, issueId: existing.id }, "failed to resume agent queue after reassignment");
+            });
+        });
+      };
       if (req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
         });
+        // A queued run of the previous assignee holds the issue lock without
+        // running, so the new assignee's wake would stay parked behind it.
+        // Snapshot these before stopping the running run: that stop frees a
+        // slot and could start one of them. Only runs whose wake reason shows
+        // the agent was woken as the issue's owner are cancelled. While the
+        // previous assignee is the current reviewer of a pending review stage,
+        // its runs are review work, which the queued-run gate also keeps.
+        const pendingReview = existing.status === "in_review"
+          ? parseIssueExecutionState(existing.executionState)
+          : null;
+        const previousAssigneeIsCurrentReviewer =
+          pendingReview?.status === "pending" &&
+          pendingReview.currentParticipant?.type === "agent" &&
+          pendingReview.currentParticipant.agentId === existing.assigneeAgentId;
+        if (!previousAssigneeIsCurrentReviewer) {
+          const queuedRuns = await db
+            .select({
+              id: heartbeatRuns.id,
+              contextSnapshot: heartbeatRuns.contextSnapshot,
+              retryOfRunId: heartbeatRuns.retryOfRunId,
+            })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, existing.companyId),
+                eq(heartbeatRuns.agentId, existing.assigneeAgentId),
+                eq(heartbeatRuns.status, "queued"),
+                // A native run is cancelled only through an audited native
+                // session decision, which a queued run does not have yet. The
+                // queued-run gate cancels it at claim instead.
+                eq(heartbeatRuns.runtimeMode, "legacy"),
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${existing.id}`,
+              ),
+            );
+          for (const queuedRun of queuedRuns) {
+            if (await isOwnershipRunForReassignment(existing.companyId, queuedRun)) {
+              queuedRunsForReassignment.push(queuedRun);
+            }
+          }
+        }
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
         if (runToStopForReassignment) {
+          holdAgentQueueUntilResponseEnds(existing.assigneeAgentId);
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
@@ -14263,6 +14346,7 @@ export function issueRoutes(
               resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
               eventMessage: "run cancelled before issue reassignment",
               eventPayload: { issueId: existing.id },
+              deferredPostCommitEffects: reassignmentQueueFence,
             },
           );
           if (!cancelled || cancelled.status !== "cancelled") {
@@ -14508,7 +14592,8 @@ export function issueRoutes(
         Boolean(decision) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
-        reviewPolicySensitiveMutationRequested;
+        reviewPolicySensitiveMutationRequested ||
+        queuedRunsForReassignment.length > 0;
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
@@ -14571,6 +14656,16 @@ export function issueRoutes(
 
             await persistReviewTransitionActivity(tx, updated);
 
+            // Last step: the queued runs are cancelled exactly when the new
+            // assignee commits. A run that started meanwhile rolls it back.
+            if (queuedRunsForReassignment.length > 0 && updated.assigneeAgentId !== existing.assigneeAgentId) {
+              cancelledReassignmentRuns = await heartbeat.cancelQueuedRunsInTx(
+                tx as unknown as Db,
+                queuedRunsForReassignment.map((queuedRun) => queuedRun.id),
+                { reason: "Cancelled by issue reassignment", errorCode: "issue_reassigned" },
+              );
+            }
+
             return updated;
           });
         } else {
@@ -14611,6 +14706,18 @@ export function issueRoutes(
       for (const publication of postCommitActivityPublications)
         publishActivity(publication);
       await flushIssuePostCommitActions(postCommitIssueActions);
+
+      // The queued runs were cancelled with the reassignment; finish their
+      // event, wake and release side effects now that it has committed.
+      if (cancelledReassignmentRuns.length > 0) {
+        holdAgentQueueUntilResponseEnds(cancelledReassignmentRuns[0]!.updated.agentId);
+        await heartbeat.settleCancelledQueuedRuns(cancelledReassignmentRuns, {
+          reason: "Cancelled by issue reassignment",
+          eventMessage: "queued run cancelled by issue reassignment",
+          eventPayload: { issueId: existing.id },
+          deferredPostCommitEffects: reassignmentQueueFence,
+        });
+      }
 
       if (enteringBlocked) {
         const blockedIssue = issue;

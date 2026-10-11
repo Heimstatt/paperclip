@@ -24,6 +24,7 @@ import {
   rethrowNativeCancellationLockConflict,
 } from "../native-runtime/native-cancellation-request.js";
 import { cancellationResultJson } from "../run-cancellation.js";
+import { REASSIGNMENT_QUEUE_CANCEL_SOURCE } from "../pre-dispatch-review-wait.js";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { isWaitingConversation } from "../agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED } from "../native-local-process-stop.js";
@@ -1068,6 +1069,56 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     }
 
     return updated;
+  }
+
+  /**
+   * Cancels a queued legacy run inside the caller's transaction, with a
+   * reassignment pre-dispatch cancel receipt. Returns null when the
+   * run has left the queue. Call this last in the transaction: the legacy
+   * terminalization sets transaction-local lock and statement timeouts.
+   * The caller publishes the change with publishRunStatusChange after commit.
+   */
+  async function cancelQueuedLegacyRunInTx(
+    tx: Db,
+    runId: string,
+    input: { reason: string; errorCode: string },
+  ) {
+    const [previous] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    if (!previous || previous.status !== "queued" || previous.runtimeMode !== "legacy") return null;
+    // The receipt lets the shared pre-dispatch verifier, not this writer,
+    // decide whether the run needs reconciliation: it does only when the row
+    // or the retained execution evidence shows the run may have dispatched.
+    const updated = await terminalizeLegacyExecution({
+      db: tx,
+      run: previous,
+      status: "cancelled",
+      fromStatuses: ["queued"],
+      reconcileIfNeeded: true,
+      patch: {
+        finishedAt: new Date(),
+        error: input.reason,
+        errorCode: input.errorCode,
+        resultJson: cancellationResultJson(previous, "cancelled", {
+          stopReason: input.errorCode,
+          timeoutSource: REASSIGNMENT_QUEUE_CANCEL_SOURCE,
+        }, input.errorCode, input.reason),
+      },
+    });
+    return updated ? { previous, updated } : null;
+  }
+
+  /** Publishes a committed run status change, as setRunStatus does. */
+  function publishRunStatusChange(
+    updated: typeof heartbeatRuns.$inferSelect,
+    previousStatus: string | null,
+  ) {
+    publishLiveEvent({
+      companyId: updated.companyId,
+      type: "heartbeat.run.status",
+      payload: buildHeartbeatRunStatusLiveEventPayload(updated),
+    });
+    publishRunLifecyclePluginEvent(updated);
+    emitTerminalAgentTaskRun(updated, previousStatus);
   }
 
   async function setRunStatusIfRunning(
@@ -2984,6 +3035,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     classifyAndPersistRunLiveness,
     setRunStatusFromLive,
     setRunStatus,
+    cancelQueuedLegacyRunInTx,
+    publishRunStatusChange,
     publishRunLifecyclePluginEventData,
     publishRunLifecyclePluginEvent,
     persistRunProcessMetadata,
