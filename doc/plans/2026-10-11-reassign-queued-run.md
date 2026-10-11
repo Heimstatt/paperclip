@@ -305,6 +305,19 @@ cd server && runuser -u postgres -- env HOME=/tmp/pgtest-home TMPDIR=/tmp/pgtest
   from Sentry diagnostics: result", also fails with the base versions of
   every changed source file, so it is not caused by this branch.
 - `pnpm --filter @paperclipai/server typecheck` passes.
+- After the rebase onto the #15483 fix (`04d8eae`), at head `f7a3ab7`:
+  - `pnpm check:module-boundaries`: passes. The import through the module
+    index now lives in the #15483 fix itself, so its head passes on its own too.
+  - `pnpm --filter @paperclipai/server typecheck`: passes.
+  - Focused tests of both branches plus the regression set, 24 files:
+    1282 of 1283 tests pass. The #15483 files are
+    `legacy-execution-recovery.test.ts`, `wake-queue/adapters/postgres.test.ts`
+    and `heartbeat-dependency-scheduling.test.ts`. The one failure is the
+    `heartbeat-process-recovery` Sentry redaction test. It also fails with the
+    `04d8eae` versions of every source file this branch changes, and with the
+    `e733bdd` versions, so neither branch causes it.
+  - `heartbeat-reassign-queued-run.test.ts`: 23 tests pass (the gate test was
+    corrected after the first run of the set, then rerun alone).
 - Not run: the full monorepo typecheck, `pnpm test:run` and `pnpm build`.
 - GitHub Actions do not run on this fork.
 
@@ -329,116 +342,3 @@ cd server && runuser -u postgres -- env HOME=/tmp/pgtest-home TMPDIR=/tmp/pgtest
      is unchanged. It is the deeper cause and affects more than reassignment.
    - No current producer leaves a native run queued, or a queued run beside a
      running holder on the same issue. The tests for both use fixtures.
-
-## Upstream Publication (Drafts, Not Published)
-
-Nothing in this section is published. The two pull requests are stacked:
-the reassignment change depends on the pre-dispatch cancel change.
-
-### Draft 1: pre-dispatch cancels need no reconciliation (paperclipai/paperclip#15483)
-
-Base: `master`. Commits: `490d44d`, `04d8eae`, and the module-boundary fix
-from this branch if it is moved down (see "Before publication" below).
-
-```markdown
-## Thinking Path
-
-> - Paperclip is the open source app people use to manage AI agents for work
-> - The heartbeat dispatcher cancels a queued run before it starts when the run lost its target, for example after a reassignment or while dependencies are blocked
-> - The legacy reconciliation classifier treats any cancelled legacy run without start evidence as an unknown provider failure
-> - Thus a run that never started leaves a permanent reconciliation hold on the issue, and deferred wakes do not get promoted
-> - This pull request generalizes the existing pre-dispatch review-wait receipt to every dispatcher staleness code and to the claim-time dependency gate, and it uses the evidence-backed check when it decides about reconciliation
-> - The benefit is that a dispatcher pre-start cancel releases the issue, while a run with any start evidence keeps the hold
-
-## Linked Issues or Issue Description
-
-Fixes: paperclipai/paperclip#15483
-
-## What Changed
-
-- `server/src/services/pre-dispatch-review-wait.ts`: `isPreDispatchCancel` accepts every queued-run staleness code except `execution_reconciliation_required` from the queued-run gate, and `issue_dependencies_blocked` from the claim-time dependency gate. `isPreDispatchCancelVerified` also requires no finalization coordinator, no held environment lease and no execution event. `isPreDispatchReviewWait` keeps its behaviour.
-- `server/src/services/legacy-execution-recovery.ts`: `legacyExecutionNeedsReconciliationWithEvidence` uses the verified pre-dispatch cancel check.
-- `server/src/modules/run-dispatch/domain/policy.ts`: the staleness codes are one exported list, `QUEUED_RUN_STALENESS_ERROR_CODES`. The module index exports it.
-- Tests for each staleness code, the dependency gate, a release that promotes saved input after a pre-start cancel, a never-run retry with a spent failure budget, and a cancelled run that had started.
-
-## Verification
-
-- `pnpm check:module-boundaries`
-- `cd server && npx vitest run src/services/legacy-execution-recovery.test.ts src/modules/wake-queue/adapters/postgres.test.ts src/__tests__/heartbeat-dependency-scheduling.test.ts`
-- `pnpm --filter @paperclipai/server typecheck`
-- Embedded Postgres does not start as root. Run the tests as a non-root user.
-
-## Risks
-
-- A never-run retry with a spent failure budget no longer keeps a hold. The earlier failed attempts keep their own reconciliation decisions.
-- A run with any start, process, session, lease or execution-event evidence keeps the hold.
-
-## Model Used
-
-- Claude (Anthropic) through Claude Code, with tool use and code execution.
-
-## Checklist
-
-(Fill in at publication.)
-```
-
-### Draft 2: reassignment cancels the previous assignee's queued runs (paperclipai/paperclip#14879)
-
-Base: the branch of Draft 1. Commits: every commit of this branch after
-`04d8eae`.
-
-```markdown
-## Thinking Path
-
-> - Paperclip is the open source app people use to manage AI agents for work
-> - The heartbeat queue starts agent runs and controls which run holds the execution lock of an issue
-> - When a user reassigns an issue, Paperclip stops the running run of the previous assignee, but it keeps the queued runs of that agent
-> - A queued run does not hold the issue lock. Thus the wake of the new assignee adopts the old queued run as lock holder and waits as `deferred_issue_execution`
-> - This pull request cancels the queued ownership runs of the previous assignee in the same transaction as the reassignment, and it promotes the waiting wake when the queued-run gate cancels a stale holder
-> - The benefit is that a reassignment starts the new assignee without a wait for the previous agent
-
-## Linked Issues or Issue Description
-
-Fixes: paperclipai/paperclip#14879
-
-Depends on: the pull request for paperclipai/paperclip#15483 (Draft 1).
-
-## What Changed
-
-- `server/src/routes/issues.ts`: on reassignment, select the queued legacy runs of the previous assignee whose wake reason shows ownership. Stopping the running run does not start that agent's queue until the response ends. The selected runs are cancelled as the last step of the issue update transaction. A rejected update keeps them queued. A run that another path started rolls the update back with 409.
-- `server/src/services/reassignment-ownership.ts`: a positive list of ownership wake reasons, derived from the producers of each reason.
-- `server/src/services/heartbeat.ts`, `heartbeat/run-control.ts`, `heartbeat/run-lifecycle.ts`: `cancelRun` accepts `deferredPostCommitEffects`; new methods `cancelQueuedRunsInTx`, `settleCancelledQueuedRuns` and `resumeAfterDeferredCancellation`.
-- `server/src/services/pre-dispatch-review-wait.ts`: a reassignment cancel source, `reassignment_queue_cancel`, valid only with `issue_reassigned`. The shared verifier decides about reconciliation for this cancel too.
-- `server/src/services/heartbeat/queue.ts`: when the queued-run gate cancels a run because the assignee changed, release the issue and promote the waiting wakes.
-- Tests through the real route and queue, a classification unit test, and one evidence test for each dispatch field.
-
-## Verification
-
-- `pnpm check:module-boundaries`
-- `cd server && npx vitest run src/__tests__/heartbeat-reassign-queued-run.test.ts src/services/reassignment-ownership.test.ts src/services/legacy-execution-recovery.test.ts`
-- `pnpm --filter @paperclipai/server typecheck`
-- Embedded Postgres does not start as root. Run the tests as a non-root user.
-
-## Risks
-
-- A claim from another path between the stop of the active run and the update commit makes the reassignment fail with 409.
-- Reassignments with the `mcp_oauth` source skip the route block and depend on the queued-run gate.
-- Two test states have no current natural producer: a native queued run, and a queued run beside a running holder on the same issue. These tests use fixtures.
-
-## Model Used
-
-- Claude (Anthropic) through Claude Code, with tool use and code execution.
-
-## Checklist
-
-(Fill in at publication.)
-```
-
-### Before publication
-
-- The module-boundary violation is in the #15483 code (`pre-dispatch-review-wait.ts`
-  imports `run-dispatch/domain/policy.js`). On this branch it is fixed in a
-  later commit. For Draft 1 to pass `pnpm check:module-boundaries` on its own,
-  that fix must move to the #15483 branch.
-- The commits listed below carry `Claude-Session` lines. Remove them before
-  publication by rewriting history; that is not done yet.
