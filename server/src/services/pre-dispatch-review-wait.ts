@@ -8,24 +8,38 @@ type DispatchFields = "startedAt" | "runtimeModeResolvedAt" | "processPid" | "pr
   "processStartedAt" | "nativeIssueId" | "nativeSessionId" | "sessionIdAfter" |
   "controllerBootId" | "controllerLeaseExpiresAt" | "executionStage" | "contextSnapshot";
 
+/** Queued-run staleness codes written by the dispatcher gate before a run is
+ * claimed. `execution_reconciliation_required` is excluded: it reports an
+ * existing hold rather than a run that merely lost its target. */
+const PRE_DISPATCH_CANCEL_CODES: ReadonlySet<string> = new Set([
+  "issue_dependencies_blocked", "issue_not_found", "issue_assignee_changed", "issue_terminal_status",
+  "issue_not_in_progress", "issue_execution_lock_changed", "issue_blocked", "issue_review_participant_changed",
+  "issue_continuation_waiting_on_review",
+]);
+
+/** A connection response wait is a pre-dispatch cancel only with the resolved
+ * connection-intent snapshot; the error code alone does not qualify. */
+function isConnectionResponseWait(run: Partial<Pick<Run, "errorCode" | "contextSnapshot">>): boolean {
+  return run.errorCode === "issue_waiting_for_response" &&
+    run.contextSnapshot?.connectionIntentResolution === "existing_connection" &&
+    run.contextSnapshot?.source === "connection_intent.resolved" &&
+    run.contextSnapshot?.interactionKind === "connection_intent" &&
+    run.contextSnapshot?.interactionStatus === "expired" &&
+    run.contextSnapshot?.mutation === "interaction" &&
+    typeof run.contextSnapshot?.interactionId === "string";
+}
+
 /** The queued-run gate owns this receipt before execution authority is claimed.
- * A deliberate review or connection response wait has no provider actions to reconcile. The error code
- * alone is not proof; missing or conflicting dispatch evidence retains the hold. */
-export function isPreDispatchReviewWait(
+ * A run it cancelled has no provider actions to reconcile. The error code alone
+ * is not proof; missing or conflicting dispatch evidence retains the hold. */
+export function isPreDispatchCancel(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
 ): boolean {
   const finalResponseWait = run.errorCode === "issue_waiting_for_response" &&
     (run.resultJson?.preDispatchResponseWait as { version?: number; providerWorkStarted?: boolean } | undefined)?.version === 1 &&
     (run.resultJson?.preDispatchResponseWait as { providerWorkStarted?: boolean } | undefined)?.providerWorkStarted === false;
   return run.runtimeMode === "legacy" && run.status === "cancelled" &&
-    (run.errorCode === "issue_continuation_waiting_on_review" ||
-      (run.errorCode === "issue_waiting_for_response" &&
-        run.contextSnapshot?.connectionIntentResolution === "existing_connection" &&
-        run.contextSnapshot?.source === "connection_intent.resolved" &&
-        run.contextSnapshot?.interactionKind === "connection_intent" &&
-        run.contextSnapshot?.interactionStatus === "expired" &&
-        run.contextSnapshot?.mutation === "interaction" &&
-        typeof run.contextSnapshot?.interactionId === "string")) &&
+    (isConnectionResponseWait(run) || (run.errorCode != null && PRE_DISPATCH_CANCEL_CODES.has(run.errorCode))) &&
     run.resultJson?.stopReason === run.errorCode &&
     run.resultJson?.timeoutSource === "stale_queued_run_gate" &&
     run.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive" &&
@@ -35,11 +49,20 @@ export function isPreDispatchReviewWait(
     (finalResponseWait || (run.controllerBootId === null && run.controllerLeaseExpiresAt === null && run.executionStage === null));
 }
 
+/** A deliberate review or connection response wait is the pre-dispatch cancel
+ * that also changes operator-facing copy and native startup admission. */
+export function isPreDispatchReviewWait(
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
+): boolean {
+  return (run.errorCode === "issue_continuation_waiting_on_review" || run.errorCode === "issue_waiting_for_response") &&
+    isPreDispatchCancel(run);
+}
+
 /** The row receipt is a candidate, not permission to discard conflicting
  * retained execution or cleanup evidence. Historical false holds must be
  * checked against the same evidence that gates explicit user admission. */
-export async function isPreDispatchReviewWaitVerified(db: Db, run: Run): Promise<boolean> {
-  if (!isPreDispatchReviewWait(run)) return false;
+export async function isPreDispatchCancelVerified(db: Db, run: Run): Promise<boolean> {
+  if (!isPreDispatchCancel(run)) return false;
   const [coordinator] = await db.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
     eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
   )).limit(1);

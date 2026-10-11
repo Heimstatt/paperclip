@@ -1,4 +1,4 @@
-import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
+import { isPreDispatchCancel, isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { expect, it } from "vitest";
 import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
 
@@ -106,4 +106,22 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { resultJson: { ...run.resultJson, stopReason: "cancelled" } },
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
+});
+
+it.each(["issue_assignee_changed", "issue_dependencies_blocked"])("treats a dispatcher %s cancel with no start evidence as a pre-dispatch cancel only", (errorCode) => {
+  const run = { runtimeMode: "legacy", status: "cancelled", errorCode,
+    startedAt: null, runtimeModeResolvedAt: null, processPid: null, processGroupId: null,
+    processStartedAt: null, nativeIssueId: null, nativeSessionId: null, sessionIdAfter: null,
+    controllerBootId: null, controllerLeaseExpiresAt: null, executionStage: null,
+    resultJson: { stopReason: errorCode, timeoutSource: "stale_queued_run_gate" } };
+  expect(isPreDispatchCancel(run)).toBe(true);
+  expect(isPreDispatchReviewWait(run)).toBe(false);
+  // The synchronous classifier stays conservative; the evidence-backed wrapper grants the exemption.
+  expect(legacyExecutionNeedsReconciliation(run)).toBe(true);
+  for (const patch of [
+    { startedAt: new Date() }, { processPid: 123 }, { processGroupId: 123 }, { sessionIdAfter: "provider-session" },
+    { errorCode: "execution_reconciliation_required", resultJson: { ...run.resultJson, stopReason: "execution_reconciliation_required" } },
+    { errorCode: "operator_interrupted", resultJson: { ...run.resultJson, stopReason: "operator_interrupted" } },
+    { resultJson: {} },
+  ]) expect(isPreDispatchCancel({ ...run, ...patch })).toBe(false);
 });
