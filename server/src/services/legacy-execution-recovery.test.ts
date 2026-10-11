@@ -1,3 +1,4 @@
+import { QUEUED_RUN_STALENESS_ERROR_CODES } from "../modules/run-dispatch/domain/policy.js";
 import { isPreDispatchCancel, isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { expect, it } from "vitest";
 import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
@@ -124,4 +125,25 @@ it.each(["issue_assignee_changed", "issue_dependencies_blocked"])("treats a disp
     { errorCode: "operator_interrupted", resultJson: { ...run.resultJson, stopReason: "operator_interrupted" } },
     { resultJson: {} },
   ]) expect(isPreDispatchCancel({ ...run, ...patch })).toBe(false);
+});
+
+it.each(QUEUED_RUN_STALENESS_ERROR_CODES)("classifies staleness code %s deliberately", (errorCode) => {
+  const run = { runtimeMode: "legacy", status: "cancelled", errorCode,
+    startedAt: null, runtimeModeResolvedAt: null, processPid: null, processGroupId: null,
+    processStartedAt: null, nativeIssueId: null, nativeSessionId: null, sessionIdAfter: null,
+    controllerBootId: null, controllerLeaseExpiresAt: null, executionStage: null,
+    resultJson: { stopReason: errorCode, timeoutSource: "stale_queued_run_gate" } };
+  // Only a code reporting an already-recorded hold is not a pre-dispatch cancel.
+  expect(isPreDispatchCancel(run)).toBe(errorCode !== "execution_reconciliation_required");
+});
+
+it("accepts the claim-time dependency gate source only for its own code", () => {
+  const run = { runtimeMode: "legacy", status: "cancelled", errorCode: "issue_dependencies_blocked",
+    startedAt: null, runtimeModeResolvedAt: null, processPid: null, processGroupId: null,
+    processStartedAt: null, nativeIssueId: null, nativeSessionId: null, sessionIdAfter: null,
+    controllerBootId: null, controllerLeaseExpiresAt: null, executionStage: null,
+    resultJson: { stopReason: "issue_dependencies_blocked", timeoutSource: "dependency_gate" } };
+  expect(isPreDispatchCancel(run)).toBe(true);
+  expect(isPreDispatchCancel({ ...run, errorCode: "issue_assignee_changed",
+    resultJson: { stopReason: "issue_assignee_changed", timeoutSource: "dependency_gate" } })).toBe(false);
 });
