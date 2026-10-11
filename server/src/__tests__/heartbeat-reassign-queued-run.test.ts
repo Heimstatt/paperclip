@@ -434,7 +434,8 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
       .select({ executionRunId: issues.executionRunId, status: issues.status })
       .from(issues)
       .where(eq(issues.id, issueId));
-    expect(released).toEqual({ executionRunId: null, status: "todo" });
+    expect(released?.status).toBe("todo");
+    expect(released?.executionRunId).not.toBe(holderRun!.id);
     // The release queues no recovery for the previous assignee.
     expect(await db
       .select({ id: heartbeatRuns.id })
@@ -447,6 +448,8 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
       return wake && wake.status !== "deferred_issue_execution" && wake.runId ? wake : null;
     });
     expect((await runStatus(promoted.runId!))?.agentId).toBe(newAgentId);
+    const [locked] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, issueId));
+    expect(locked?.executionRunId).toBe(promoted.runId);
   });
 
   it("leaves a native queued run to the queued-run gate without a reconciliation hold", async () => {
