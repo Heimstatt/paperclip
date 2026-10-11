@@ -301,72 +301,8 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
     expect(promotedRun?.agentId).toBe(newAgentId);
   });
 
-  it("leaves queued mention wakes alone when the issue is reassigned", async () => {
-    const { companyId, previousAgentId, newAgentId, thirdAgentId, issueId } = await seedScenario();
-
-    // The previous assignee's own queued ownership run, created first so it
-    // is a real queued run rather than a wake parked behind the mentions.
-    const ownershipRun = await heartbeat.wakeup(previousAgentId, {
-      source: "assignment",
-      triggerDetail: "system",
-      reason: "issue_assigned",
-      payload: { issueId, mutation: "update" },
-      requestedByActorType: "user",
-      requestedByActorId: "local-board",
-      contextSnapshot: { issueId, source: "issue.update", wakeReason: "issue_assigned" },
-    });
-    expect(ownershipRun?.status).toBe("queued");
-
-    // A queued mention wake for a third agent, parked on the same issue.
-    const mentionWakeupId = randomUUID();
-    const mentionRunId = randomUUID();
-    await db.insert(agentWakeupRequests).values({
-      id: mentionWakeupId,
-      companyId,
-      agentId: thirdAgentId,
-      source: "comment",
-      triggerDetail: "mention",
-      reason: "issue_comment_mentioned",
-      payload: { issueId },
-      status: "queued",
-    });
-    await db.insert(heartbeatRuns).values({
-      id: mentionRunId,
-      companyId,
-      agentId: thirdAgentId,
-      invocationSource: "automation",
-      triggerDetail: "system",
-      status: "queued",
-      wakeupRequestId: mentionWakeupId,
-      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_comment_mentioned" },
-    });
-
-    // A queued mention wake for the previous assignee on the same issue. The
-    // reassignment cancels that agent's ownership runs but not this one.
-    const ownMentionWakeupId = randomUUID();
-    const ownMentionRunId = randomUUID();
-    await db.insert(agentWakeupRequests).values({
-      id: ownMentionWakeupId,
-      companyId,
-      agentId: previousAgentId,
-      source: "comment",
-      triggerDetail: "mention",
-      reason: "issue_comment_mentioned",
-      payload: { issueId },
-      status: "queued",
-    });
-    await db.insert(heartbeatRuns).values({
-      id: ownMentionRunId,
-      companyId,
-      agentId: previousAgentId,
-      invocationSource: "automation",
-      triggerDetail: "system",
-      status: "queued",
-      wakeupRequestId: ownMentionWakeupId,
-      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_comment_mentioned" },
-    });
-
-
+  it("leaves the previous assignee's queued interaction_pending wake alone when the issue is reassigned", async () => {
+    const { companyId, previousAgentId, newAgentId, issueId } = await seedScenario();
     const app = appFor({
       type: "board",
       source: "session",
@@ -375,16 +311,31 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
       memberships: [{ companyId, membershipRole: "operator", status: "active" }],
       isInstanceAdmin: true,
     });
+
+    // The interaction route wakes the interaction's addressee, chosen as the
+    // addressee and not as the issue owner. Its slot is busy, so it queues.
+    await request(app)
+      .post(`/api/issues/${issueId}/interactions`)
+      .send({
+        kind: "request_confirmation",
+        addresseeAgentId: previousAgentId,
+        payload: { version: 1, prompt: "Confirm the plan?" },
+      })
+      .expect(201);
+    const interactionRun = await waitFor(async () => {
+      const [run] = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, previousAgentId), eq(heartbeatRuns.status, "queued")));
+      return run ?? null;
+    });
+    expect((interactionRun.contextSnapshot as Record<string, unknown>).wakeReason).toBe("interaction_pending");
+
     await request(app)
       .patch(`/api/issues/${issueId}`)
       .send({ assigneeAgentId: newAgentId })
       .expect(200);
 
-    expect(await runStatus(mentionRunId)).toMatchObject({ status: "queued", errorCode: null });
-    expect(await runStatus(ownMentionRunId)).toMatchObject({ status: "queued", errorCode: null });
-    expect(await runStatus(ownershipRun!.id)).toMatchObject({
-      status: "cancelled",
-      errorCode: "issue_reassigned",
-    });
+    expect(await runStatus(interactionRun.id)).toMatchObject({ status: "queued", errorCode: null });
   });
 });
