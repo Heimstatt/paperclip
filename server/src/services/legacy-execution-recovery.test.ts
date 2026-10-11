@@ -147,3 +147,17 @@ it("accepts the claim-time dependency gate source only for its own code", () => 
   expect(isPreDispatchCancel({ ...run, errorCode: "issue_assignee_changed",
     resultJson: { stopReason: "issue_assignee_changed", timeoutSource: "dependency_gate" } })).toBe(false);
 });
+
+it("accepts the reassignment cancel source only for issue_reassigned", () => {
+  const run = { runtimeMode: "legacy", status: "cancelled", errorCode: "issue_reassigned",
+    startedAt: null, runtimeModeResolvedAt: null, processPid: null, processGroupId: null,
+    processStartedAt: null, nativeIssueId: null, nativeSessionId: null, sessionIdAfter: null,
+    controllerBootId: null, controllerLeaseExpiresAt: null, executionStage: null,
+    resultJson: { stopReason: "issue_reassigned", timeoutSource: "reassignment_queue_cancel" } };
+  expect(isPreDispatchCancel(run)).toBe(true);
+  expect(isPreDispatchReviewWait(run)).toBe(false);
+  expect(isPreDispatchCancel({ ...run, resultJson: { ...run.resultJson, timeoutSource: "stale_queued_run_gate" } })).toBe(false);
+  expect(isPreDispatchCancel({ ...run, errorCode: "issue_assignee_changed",
+    resultJson: { stopReason: "issue_assignee_changed", timeoutSource: "reassignment_queue_cancel" } })).toBe(false);
+  expect(isPreDispatchCancel({ ...run, executionStage: "preparing" })).toBe(false);
+});

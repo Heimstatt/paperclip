@@ -1,6 +1,6 @@
 import { and, eq, inArray, isNotNull, or } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
-import { QUEUED_RUN_STALENESS_ERROR_CODES } from "../modules/run-dispatch/domain/policy.js";
+import { QUEUED_RUN_STALENESS_ERROR_CODES } from "../modules/run-dispatch/index.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
@@ -11,23 +11,33 @@ type DispatchFields = "startedAt" | "runtimeModeResolvedAt" | "processPid" | "pr
 
 /** Every queued-run staleness code is a pre-dispatch cancel except
  * `execution_reconciliation_required`, which reports an existing hold rather
- * than a run that merely lost its target. Derived so a new code is a decision. */
-const PRE_DISPATCH_CANCEL_CODES: ReadonlySet<string> = new Set(
-  QUEUED_RUN_STALENESS_ERROR_CODES.filter(code => code !== "execution_reconciliation_required"),
-);
+ * than a run that merely lost its target. Derived so a new code is a decision.
+ * Read at call time: the run-dispatch index can be mid-evaluation when this
+ * module loads through an import cycle. */
+function isPreDispatchCancelCode(code: string): boolean {
+  return code !== "execution_reconciliation_required" &&
+    (QUEUED_RUN_STALENESS_ERROR_CODES as readonly string[]).includes(code);
+}
 
-/** The dispatcher gate and the claim-time dependency gate both cancel a queued
- * run before any execution authority is claimed; each stamps its own source. */
+/** Stamped by the issue route when a reassignment cancels the previous
+ * assignee's queued runs in the same transaction as the new assignee. */
+export const REASSIGNMENT_QUEUE_CANCEL_SOURCE = "reassignment_queue_cancel";
+
+/** The dispatcher gate, the claim-time dependency gate and the reassignment
+ * cancel each stop a queued run before any execution authority is claimed;
+ * each stamps its own source, valid only with its own codes. */
 function hasPreDispatchCancelSource(run: Pick<Run, "errorCode" | "resultJson">): boolean {
   const source = run.resultJson?.timeoutSource;
-  return source === "stale_queued_run_gate" ||
-    (source === "dependency_gate" && run.errorCode === "issue_dependencies_blocked");
+  if (source === "stale_queued_run_gate") return run.errorCode != null && isPreDispatchCancelCode(run.errorCode);
+  if (source === "dependency_gate") return run.errorCode === "issue_dependencies_blocked";
+  if (source === REASSIGNMENT_QUEUE_CANCEL_SOURCE) return run.errorCode === "issue_reassigned";
+  return false;
 }
 
 /** True only when the run row carries no evidence that execution authority
  * was ever claimed: a legacy run with every dispatch field still empty and no
  * unsafe workspace archive. Any missing or conflicting field fails closed. */
-export function hasNoDispatchEvidenceOnRow(
+function hasNoDispatchEvidenceOnRow(
   run: Pick<Run, "runtimeMode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
 ): boolean {
   return run.runtimeMode === "legacy" &&
@@ -42,7 +52,7 @@ export function hasNoDispatchEvidenceOnRow(
  * retained execution or cleanup evidence: a finalization coordinator, an
  * unreleased or unterminated environment lease, or a recorded execution event
  * each mean the run may have reached its provider. */
-export async function hasVerifiedNoDispatchEvidence(db: Db, run: Run): Promise<boolean> {
+async function hasVerifiedNoDispatchEvidence(db: Db, run: Run): Promise<boolean> {
   if (!hasNoDispatchEvidenceOnRow(run)) return false;
   const [coordinator] = await db.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
     eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
@@ -64,14 +74,14 @@ export async function hasVerifiedNoDispatchEvidence(db: Db, run: Run): Promise<b
   return !execution;
 }
 
-/** The queued-run gate owns this receipt before execution authority is claimed.
- * A run it cancelled has no provider actions to reconcile. The error code alone
+/** A pre-dispatch cancel receipt: a run stopped before execution authority
+ * was claimed has no provider actions to reconcile. The error code alone
  * is not proof; missing or conflicting dispatch evidence retains the hold. */
 export function isPreDispatchCancel(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
 ): boolean {
   return run.status === "cancelled" &&
-    run.errorCode != null && PRE_DISPATCH_CANCEL_CODES.has(run.errorCode) &&
+    run.errorCode != null &&
     run.resultJson?.stopReason === run.errorCode &&
     hasPreDispatchCancelSource(run) &&
     hasNoDispatchEvidenceOnRow(run);

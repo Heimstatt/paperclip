@@ -20,6 +20,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { legacyExecutionNeedsReconciliationWithEvidence } from "../services/legacy-execution-recovery.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -380,7 +381,7 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
     expect(await runStatus(queuedRun!.id)).toMatchObject({ status: "queued", errorCode: null });
   });
 
-  it("cancels a stale legacy holder at the queued-run gate and frees the issue lock", async () => {
+  it("cancels a stale legacy holder at the queued-run gate and promotes the deferred wake", async () => {
     const { previousAgentId, newAgentId, issueId } = await seedScenario();
 
     const holderRun = await heartbeat.wakeup(previousAgentId, {
@@ -439,10 +440,13 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.agentId, previousAgentId), eq(heartbeatRuns.status, "queued")))).toEqual([]);
-    // Promoting the deferred wake behind a cancelled legacy holder needs
-    // proof that the holder never started. That verifier belongs to the fix
-    // for paperclipai/paperclip#15483; this branch only frees the lock. A
-    // native holder is promoted here already (see the native test).
+    // The shared pre-dispatch verifier proves the holder never started, so the
+    // release promotes the new assignee's deferred wake.
+    const promoted = await waitFor(async () => {
+      const wake = await latestWakeFor(newAgentId, issueId);
+      return wake && wake.status !== "deferred_issue_execution" && wake.runId ? wake : null;
+    });
+    expect((await runStatus(promoted.runId!))?.agentId).toBe(newAgentId);
   });
 
   it("leaves a native queued run to the queued-run gate without a reconciliation hold", async () => {
@@ -539,7 +543,7 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
     expect(await runStatus(interactionRun.id)).toMatchObject({ status: "queued", errorCode: null });
   });
 
-  describe("no-provider-work evidence on a transactional queued-run cancel", () => {
+  describe("reconciliation after a transactional queued-run cancel", () => {
     async function seedQueuedRun(patch: Partial<typeof heartbeatRuns.$inferInsert> = {}) {
       const { companyId, previousAgentId, issueId } = await seedScenario();
       const runId = randomUUID();
@@ -556,24 +560,38 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
       return { companyId, agentId: previousAgentId, issueId, runId };
     }
 
-    async function cancelAndReadEvidence(runId: string) {
+    async function cancelAndCheckReconciliation(runId: string) {
       const cancelled = await db.transaction((tx) =>
         heartbeat.cancelQueuedRunsInTx(tx as unknown as typeof db, [runId], {
           reason: "Cancelled by issue reassignment",
           errorCode: "issue_reassigned",
         }));
       expect(cancelled).toHaveLength(1);
-      const [row] = await db
-        .select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, runId));
+      const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       expect(row?.status).toBe("cancelled");
-      return (row?.resultJson as Record<string, unknown> | null)?.executionRecovery;
+      expect(row?.resultJson).toMatchObject({ stopReason: "issue_reassigned", timeoutSource: "reassignment_queue_cancel" });
+      // The shared pre-dispatch verifier decides; this cancel writes no marker of its own.
+      expect((row?.resultJson as Record<string, unknown>).executionRecovery).toBeUndefined();
+      return legacyExecutionNeedsReconciliationWithEvidence(db, row!);
     }
 
-    it("records it for a queued run with no dispatch evidence", async () => {
+    it("needs no reconciliation for a queued run with no dispatch evidence", async () => {
       const { runId } = await seedQueuedRun();
-      expect(await cancelAndReadEvidence(runId)).toEqual({ kind: "bootstrap", providerWorkStarted: false });
+      expect(await cancelAndCheckReconciliation(runId)).toBe(false);
+    });
+
+    it("needs no reconciliation for a never-run retry whose failure budget is spent", async () => {
+      const { companyId, agentId, issueId, runId } = await seedQueuedRun();
+      const sourceRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: sourceRunId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system",
+        status: "failed", errorCode: "process_lost", startedAt: new Date(), finishedAt: new Date(),
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      });
+      await db.update(heartbeatRuns)
+        .set({ retryOfRunId: sourceRunId, scheduledRetryAttempt: 2, scheduledRetryReason: "process_lost" })
+        .where(eq(heartbeatRuns.id, runId));
+      expect(await cancelAndCheckReconciliation(runId)).toBe(false);
     });
 
     it.each([
@@ -589,25 +607,25 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
       ["controllerLeaseExpiresAt", { controllerLeaseExpiresAt: new Date() }],
       ["executionStage", { executionStage: "preparing" }],
       ["an unsafe workspace archive", { resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } }],
-    ] as const)("does not record it when the run row has %s", async (_label, patch) => {
+    ] as const)("keeps reconciliation when the run row has %s", async (_label, patch) => {
       const { runId } = await seedQueuedRun(patch as Partial<typeof heartbeatRuns.$inferInsert>);
-      expect(await cancelAndReadEvidence(runId)).toBeUndefined();
+      expect(await cancelAndCheckReconciliation(runId)).toBe(true);
     });
 
     // A native finalization coordinator cannot exist without the run's
     // nativeIssueId (native_run_finalizations_run_owner_fk), so that case is
     // covered by the nativeIssueId row case above.
 
-    it("does not record it when an environment lease is still held", async () => {
+    it("keeps reconciliation when an environment lease is still held", async () => {
       const { companyId, runId } = await seedQueuedRun();
       await db.insert(environmentLeases).values({ companyId, heartbeatRunId: runId, provider: "local" });
-      expect(await cancelAndReadEvidence(runId)).toBeUndefined();
+      expect(await cancelAndCheckReconciliation(runId)).toBe(true);
     });
 
-    it("does not record it when an execution event was recorded", async () => {
+    it("keeps reconciliation when an execution event was recorded", async () => {
       const { companyId, agentId, runId } = await seedQueuedRun();
       await db.insert(heartbeatRunEvents).values({ companyId, runId, agentId, seq: 1, eventType: "adapter.invoke" });
-      expect(await cancelAndReadEvidence(runId)).toBeUndefined();
+      expect(await cancelAndCheckReconciliation(runId)).toBe(true);
     });
   });
 });
