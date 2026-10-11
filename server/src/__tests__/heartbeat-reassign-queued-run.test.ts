@@ -234,6 +234,13 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
     const newWake = await waitFor(() => latestWakeFor(newAgentId, issueId));
     expect(newWake.status).not.toBe("deferred_issue_execution");
     expect(newWake.status).not.toBe("cancelled");
+
+    // No recovery run is queued for the previous assignee in its place.
+    const previousLiveRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, previousAgentId), eq(heartbeatRuns.status, "queued")));
+    expect(previousLiveRuns).toEqual([]);
   });
 
   it("promotes the new assignee's deferred wake when the stale queued-run gate cancels the holder", async () => {
@@ -281,7 +288,10 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
       .where(and(eq(heartbeatRuns.agentId, previousAgentId), eq(heartbeatRuns.status, "running")));
     await heartbeat.resumeQueuedRuns();
 
-    expect(await runStatus(holderRun!.id)).toMatchObject({ status: "cancelled" });
+    expect(await runStatus(holderRun!.id)).toMatchObject({
+      status: "cancelled",
+      errorCode: "issue_assignee_changed",
+    });
     const promoted = await waitFor(async () => {
       const wake = await latestWakeFor(newAgentId, issueId);
       return wake && wake.status !== "deferred_issue_execution" && wake.runId ? wake : null;
@@ -291,8 +301,21 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
     expect(promotedRun?.agentId).toBe(newAgentId);
   });
 
-  it("leaves a queued mention wake of another agent alone when the issue is reassigned", async () => {
+  it("leaves queued mention wakes alone when the issue is reassigned", async () => {
     const { companyId, previousAgentId, newAgentId, thirdAgentId, issueId } = await seedScenario();
+
+    // The previous assignee's own queued ownership run, created first so it
+    // is a real queued run rather than a wake parked behind the mentions.
+    const ownershipRun = await heartbeat.wakeup(previousAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId, mutation: "update" },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+      contextSnapshot: { issueId, source: "issue.update", wakeReason: "issue_assigned" },
+    });
+    expect(ownershipRun?.status).toBe("queued");
 
     // A queued mention wake for a third agent, parked on the same issue.
     const mentionWakeupId = randomUUID();
@@ -318,17 +341,31 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
       contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_comment_mentioned" },
     });
 
-    // The previous assignee's queued run is still present, so the reassignment
-    // has something to cancel alongside the mention.
-    await heartbeat.wakeup(previousAgentId, {
-      source: "assignment",
-      triggerDetail: "system",
-      reason: "issue_assigned",
-      payload: { issueId, mutation: "update" },
-      requestedByActorType: "user",
-      requestedByActorId: "local-board",
-      contextSnapshot: { issueId, source: "issue.update", wakeReason: "issue_assigned" },
+    // A queued mention wake for the previous assignee on the same issue. The
+    // reassignment cancels that agent's ownership runs but not this one.
+    const ownMentionWakeupId = randomUUID();
+    const ownMentionRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: ownMentionWakeupId,
+      companyId,
+      agentId: previousAgentId,
+      source: "comment",
+      triggerDetail: "mention",
+      reason: "issue_comment_mentioned",
+      payload: { issueId },
+      status: "queued",
     });
+    await db.insert(heartbeatRuns).values({
+      id: ownMentionRunId,
+      companyId,
+      agentId: previousAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: ownMentionWakeupId,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_comment_mentioned" },
+    });
+
 
     const app = appFor({
       type: "board",
@@ -344,5 +381,10 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
       .expect(200);
 
     expect(await runStatus(mentionRunId)).toMatchObject({ status: "queued", errorCode: null });
+    expect(await runStatus(ownMentionRunId)).toMatchObject({ status: "queued", errorCode: null });
+    expect(await runStatus(ownershipRun!.id)).toMatchObject({
+      status: "cancelled",
+      errorCode: "issue_reassigned",
+    });
   });
 });
