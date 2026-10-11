@@ -11,6 +11,7 @@ import {
   companies,
   costEvents,
   createDb,
+  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issueRecoveryActions,
@@ -536,5 +537,77 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
       .expect(200);
 
     expect(await runStatus(interactionRun.id)).toMatchObject({ status: "queued", errorCode: null });
+  });
+
+  describe("no-provider-work evidence on a transactional queued-run cancel", () => {
+    async function seedQueuedRun(patch: Partial<typeof heartbeatRuns.$inferInsert> = {}) {
+      const { companyId, previousAgentId, issueId } = await seedScenario();
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: previousAgentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        ...patch,
+      });
+      return { companyId, agentId: previousAgentId, issueId, runId };
+    }
+
+    async function cancelAndReadEvidence(runId: string) {
+      const cancelled = await db.transaction((tx) =>
+        heartbeat.cancelQueuedRunsInTx(tx as unknown as typeof db, [runId], {
+          reason: "Cancelled by issue reassignment",
+          errorCode: "issue_reassigned",
+        }));
+      expect(cancelled).toHaveLength(1);
+      const [row] = await db
+        .select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      expect(row?.status).toBe("cancelled");
+      return (row?.resultJson as Record<string, unknown> | null)?.executionRecovery;
+    }
+
+    it("records it for a queued run with no dispatch evidence", async () => {
+      const { runId } = await seedQueuedRun();
+      expect(await cancelAndReadEvidence(runId)).toEqual({ kind: "bootstrap", providerWorkStarted: false });
+    });
+
+    it.each([
+      ["startedAt", { startedAt: new Date() }],
+      ["runtimeModeResolvedAt", { runtimeModeResolvedAt: new Date() }],
+      ["processPid", { processPid: 123 }],
+      ["processGroupId", { processGroupId: 123 }],
+      ["processStartedAt", { processStartedAt: new Date() }],
+      ["nativeIssueId", { nativeIssueId: randomUUID() }],
+      ["nativeSessionId", { nativeSessionId: randomUUID() }],
+      ["sessionIdAfter", { sessionIdAfter: "provider-session" }],
+      ["controllerBootId", { controllerBootId: randomUUID() }],
+      ["controllerLeaseExpiresAt", { controllerLeaseExpiresAt: new Date() }],
+      ["executionStage", { executionStage: "preparing" }],
+      ["an unsafe workspace archive", { resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } }],
+    ] as const)("does not record it when the run row has %s", async (_label, patch) => {
+      const { runId } = await seedQueuedRun(patch as Partial<typeof heartbeatRuns.$inferInsert>);
+      expect(await cancelAndReadEvidence(runId)).toBeUndefined();
+    });
+
+    // A native finalization coordinator cannot exist without the run's
+    // nativeIssueId (native_run_finalizations_run_owner_fk), so that case is
+    // covered by the nativeIssueId row case above.
+
+    it("does not record it when an environment lease is still held", async () => {
+      const { companyId, runId } = await seedQueuedRun();
+      await db.insert(environmentLeases).values({ companyId, heartbeatRunId: runId, provider: "local" });
+      expect(await cancelAndReadEvidence(runId)).toBeUndefined();
+    });
+
+    it("does not record it when an execution event was recorded", async () => {
+      const { companyId, agentId, runId } = await seedQueuedRun();
+      await db.insert(heartbeatRunEvents).values({ companyId, runId, agentId, seq: 1, eventType: "adapter.invoke" });
+      expect(await cancelAndReadEvidence(runId)).toBeUndefined();
+    });
   });
 });

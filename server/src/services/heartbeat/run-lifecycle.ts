@@ -24,6 +24,7 @@ import {
   rethrowNativeCancellationLockConflict,
 } from "../native-runtime/native-cancellation-request.js";
 import { cancellationResultJson } from "../run-cancellation.js";
+import { hasVerifiedNoDispatchEvidence } from "../pre-dispatch-review-wait.js";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { isWaitingConversation } from "../agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED } from "../native-local-process-stop.js";
@@ -1071,8 +1072,9 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
   }
 
   /**
-   * Cancels a queued legacy run inside the caller's transaction, with the same
-   * cancellation and bootstrap evidence as setRunStatus. Returns null when the
+   * Cancels a queued legacy run inside the caller's transaction. It writes the
+   * bootstrap evidence only after the shared pre-dispatch verifier proves the
+   * run never reached dispatch. Returns null when the
    * run has left the queue. Call this last in the transaction: the legacy
    * terminalization sets transaction-local lock and statement timeouts.
    * The caller publishes the change with publishRunStatusChange after commit.
@@ -1085,6 +1087,10 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     const [previous] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     if (!previous || previous.status !== "queued" || previous.runtimeMode !== "legacy") return null;
     const resultJson = cancellationResultJson(previous, "cancelled", undefined, input.errorCode, input.reason);
+    // Record no-provider-work only when the row and the retained execution
+    // evidence both prove the run never reached dispatch. Ambiguous evidence
+    // keeps the run under reconciliation.
+    const provenUndispatched = await hasVerifiedNoDispatchEvidence(tx, previous);
     const updated = await terminalizeLegacyExecution({
       db: tx,
       run: previous,
@@ -1095,7 +1101,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         finishedAt: new Date(),
         error: input.reason,
         errorCode: input.errorCode,
-        resultJson: !previous.startedAt && !previous.processPid
+        resultJson: provenUndispatched
           ? { ...previous.resultJson, ...resultJson, executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
           : resultJson,
       },
