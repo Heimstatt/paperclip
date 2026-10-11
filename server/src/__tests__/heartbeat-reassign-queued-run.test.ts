@@ -13,6 +13,7 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
@@ -243,6 +244,56 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
     expect(previousLiveRuns).toEqual([]);
   });
 
+  it("keeps the previous assignee's queued run when the reassigning update is rejected", async () => {
+    const { companyId, previousAgentId, newAgentId, issueId } = await seedScenario();
+    const queuedRun = await heartbeat.wakeup(previousAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId, mutation: "update" },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+      contextSnapshot: { issueId, source: "issue.update", wakeReason: "issue_assigned" },
+    });
+    expect(queuedRun?.status).toBe("queued");
+
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Open blocker",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 2,
+    });
+    const app = appFor({
+      type: "board",
+      source: "session",
+      userId: "local-board",
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "operator", status: "active" }],
+      isInstanceAdmin: true,
+    });
+    await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ blockedByIssueIds: [blockerIssueId] })
+      .expect(200);
+
+    // The reassignment selects the queued run, then the update itself is
+    // rejected because the issue still has an open blocker.
+    await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: newAgentId, status: "in_progress" })
+      .expect(422);
+
+    const [issue] = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issue?.assigneeAgentId).toBe(previousAgentId);
+    expect(await runStatus(queuedRun!.id)).toMatchObject({ status: "queued", errorCode: null });
+  });
+
   it("promotes the new assignee's deferred wake when the stale queued-run gate cancels the holder", async () => {
     const { previousAgentId, newAgentId, issueId } = await seedScenario();
 
@@ -299,6 +350,62 @@ describeEmbeddedPostgres("reassignment of an issue with a queued previous-assign
     expect(promoted.runId).not.toBeNull();
     const promotedRun = await runStatus(promoted.runId!);
     expect(promotedRun?.agentId).toBe(newAgentId);
+  });
+
+  it("leaves a native queued run to the queued-run gate without a reconciliation hold", async () => {
+    // No current producer leaves a native run queued: native mode is resolved
+    // while a claimed run is prepared. This pins the outcome should one exist.
+    const { companyId, previousAgentId, newAgentId, issueId } = await seedScenario();
+    const nativeRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nativeRunId,
+      companyId,
+      agentId: previousAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      runtimeMode: "native",
+      runtimeModeResolvedAt: new Date(),
+      nativeIssueId: issueId,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+    });
+
+    const app = appFor({
+      type: "board",
+      source: "session",
+      userId: "local-board",
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "operator", status: "active" }],
+      isInstanceAdmin: true,
+    });
+    await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: newAgentId })
+      .expect(200);
+
+    // The route does not cancel native runs.
+    expect(await runStatus(nativeRunId)).toMatchObject({ status: "queued", errorCode: null });
+
+    // Once the previous assignee has a free slot, the gate cancels the run.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(and(eq(heartbeatRuns.agentId, previousAgentId), eq(heartbeatRuns.status, "running")));
+    await heartbeat.resumeQueuedRuns();
+
+    expect(await runStatus(nativeRunId)).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+    const [issue] = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issue).toEqual({ status: "todo", assigneeAgentId: newAgentId });
+    expect(await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))).toEqual([]);
+    const promoted = await waitFor(async () => {
+      const wake = await latestWakeFor(newAgentId, issueId);
+      return wake && wake.status !== "deferred_issue_execution" && wake.runId ? wake : null;
+    });
+    expect((await runStatus(promoted.runId!))?.agentId).toBe(newAgentId);
   });
 
   it("leaves the previous assignee's queued interaction_pending wake alone when the issue is reassigned", async () => {
