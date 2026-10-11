@@ -239,6 +239,12 @@ export type CancelRunOptions = {
     terminationGraceMs?: number;
     /** Caller is immediately scheduling an explicit successor path. */
     suppressImmediateRecovery?: boolean;
+    /**
+     * Collects the release's post-commit effects here and skips starting the
+     * agent's next queued run. The caller applies both once it is safe, for
+     * example after an issue reassignment has committed.
+     */
+    deferredPostCommitEffects?: WakeQueuePostCommitEffect[];
   };
 
 /** Run control binds cancellation, resource release, and saved-input resumption. */
@@ -1182,11 +1188,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         });
         await releaseIssueExecutionAndPromote(cancelled, {
           suppressImmediateRecovery: options.suppressImmediateRecovery,
+          deferredPostCommitEffects: options.deferredPostCommitEffects,
         });
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
-        await startNextQueuedRunForAgent(run.agentId);
+        if (!options.deferredPostCommitEffects) await startNextQueuedRunForAgent(run.agentId);
       }
       return cancelled;
     } finally {

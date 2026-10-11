@@ -14269,10 +14269,23 @@ export function issueRoutes(
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
-      // Queued ownership runs of the previous assignee, cancelled once the
-      // reassignment has committed (see below).
+      // Queued ownership runs of the previous assignee. They are cancelled in
+      // the same transaction as the reassignment (see below).
       const queuedRunsForReassignment: { id: string }[] = [];
+      let cancelledReassignmentRuns: Awaited<ReturnType<typeof heartbeat.cancelQueuedRunsInTx>> = [];
+      // While the reassignment is in flight, stopping the previous assignee's
+      // run must not start that agent's queue: a selected queued run would be
+      // claimed under the old assignment. Starts resume once the response ends.
+      const reassignmentQueueFence: Parameters<typeof heartbeat.resumeAfterDeferredCancellation>[1] = [];
       if (req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
+        const fencedAgentId = existing.assigneeAgentId;
+        res.once("close", () => {
+          void heartbeat
+            .resumeAfterDeferredCancellation(fencedAgentId, reassignmentQueueFence.splice(0))
+            .catch((err) => {
+              logger.warn({ err, agentId: fencedAgentId, issueId: existing.id }, "failed to resume agent queue after reassignment");
+            });
+        });
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
@@ -14328,6 +14341,7 @@ export function issueRoutes(
               resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
               eventMessage: "run cancelled before issue reassignment",
               eventPayload: { issueId: existing.id },
+              deferredPostCommitEffects: reassignmentQueueFence,
             },
           );
           if (!cancelled || cancelled.status !== "cancelled") {
@@ -14573,7 +14587,8 @@ export function issueRoutes(
         Boolean(decision) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
-        reviewPolicySensitiveMutationRequested;
+        reviewPolicySensitiveMutationRequested ||
+        queuedRunsForReassignment.length > 0;
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
@@ -14636,6 +14651,16 @@ export function issueRoutes(
 
             await persistReviewTransitionActivity(tx, updated);
 
+            // Last step: the queued runs are cancelled exactly when the new
+            // assignee commits. A run that started meanwhile rolls it back.
+            if (queuedRunsForReassignment.length > 0 && updated.assigneeAgentId !== existing.assigneeAgentId) {
+              cancelledReassignmentRuns = await heartbeat.cancelQueuedRunsInTx(
+                tx as unknown as Db,
+                queuedRunsForReassignment.map((queuedRun) => queuedRun.id),
+                { reason: "Cancelled by issue reassignment", errorCode: "issue_reassigned" },
+              );
+            }
+
             return updated;
           });
         } else {
@@ -14677,32 +14702,14 @@ export function issueRoutes(
         publishActivity(publication);
       await flushIssuePostCommitActions(postCommitIssueActions);
 
-      // Cancel only after the reassignment has committed, so a failed update
-      // leaves the previous assignee's queued work in place. The assignee is
-      // now the new agent, so the release does not queue recovery for the old
-      // one, and native terminal recovery does not apply to its runs.
-      if (issue.assigneeAgentId !== existing.assigneeAgentId) {
-        for (const queuedRun of queuedRunsForReassignment) {
-          const cancelledQueued = await heartbeat.cancelRun(
-            queuedRun.id,
-            "Cancelled after issue reassignment",
-            {
-              errorCode: "issue_reassigned",
-              eventMessage: "queued run cancelled after issue reassignment",
-              eventPayload: { issueId: existing.id },
-            },
-          ).catch((err) => {
-            logger.warn({ err, runId: queuedRun.id, issueId: existing.id }, "failed to cancel queued run after reassignment");
-            return null;
-          });
-          // The reassignment has committed; a run that stays live is left to
-          // the queued-run gate, which cancels it and promotes the new wake.
-          if (cancelledQueued && ["queued", "running", "scheduled_retry"].includes(cancelledQueued.status)) {
-            logger.warn({ runId: queuedRun.id, issueId: existing.id, status: cancelledQueued.status },
-              "queued run still live after reassignment cancel");
-          }
-        }
-      }
+      // The queued runs were cancelled with the reassignment; finish their
+      // event, wake and release side effects now that it has committed.
+      await heartbeat.settleCancelledQueuedRuns(cancelledReassignmentRuns, {
+        reason: "Cancelled by issue reassignment",
+        eventMessage: "queued run cancelled by issue reassignment",
+        eventPayload: { issueId: existing.id },
+        deferredPostCommitEffects: reassignmentQueueFence,
+      });
 
       if (enteringBlocked) {
         const blockedIssue = issue;
