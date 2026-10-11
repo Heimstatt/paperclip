@@ -241,8 +241,10 @@ cd server && runuser -u postgres -- env HOME=/tmp/pgtest-home TMPDIR=/tmp/pgtest
     cancelled with `issue_reassigned` although the update was rejected).
   - `run-dispatch/adapters/postgres.test.ts`: 50 tests passed, including the
     four evidence-marker cases.
-  - The full regression set was rerun on this change; see the following
-    commit.
+  - Full regression set, rerun on this change: the fifteen batch files above
+    plus `reassignment-ownership.test.ts`, `heartbeat-reassign-queued-run.test.ts`
+    and `issue-agent-mutation-ownership-routes.test.ts`. 18 files, 752 tests
+    passed.
 - `pnpm --filter @paperclipai/server typecheck` passes.
 - Not run: the full monorepo typecheck, `pnpm test:run` and `pnpm build`.
 
