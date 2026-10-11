@@ -874,6 +874,20 @@ export function createPostgresRunDispatchAdapter(
     return transactionResult.outcome;
   }
 
+  /**
+   * True only for a legacy run with no evidence of a claim, a start, a
+   * process, a provider session or an earlier attempt. The claim UPDATE sets
+   * executionStage and controllerBootId, so their absence rules out a claim.
+   */
+  function isUnclaimedFirstAttempt(run: HeartbeatRun) {
+    return run.runtimeMode === "legacy" &&
+      !run.startedAt && !run.executionStage && !run.controllerBootId &&
+      !run.processPid && !run.processGroupId && !run.processStartedAt &&
+      !run.externalRunId && !run.sessionIdAfter &&
+      !run.retryOfRunId && run.scheduledRetryAttempt === 0 && !run.scheduledRetryReason &&
+      run.processLossRetryCount === 0;
+  }
+
   async function cancelStaleRunInTx(
     tx: Db,
     run: HeartbeatRun,
@@ -895,11 +909,12 @@ export function createPostgresRunDispatchAdapter(
             ...(decision.errorCode === "execution_reconciliation_required"
               ? { executionWait: decision.details }
               : {}),
-            // A queued legacy run cancelled before dispatch never reached its
-            // provider, so there is nothing to reconcile. Recording that lets the
-            // release drain promote the deferred wake parked behind it.
-            ...(expectedStatus === "queued" && decision.errorCode !== "execution_reconciliation_required" &&
-              run.runtimeMode !== "native" && !run.startedAt && !run.processPid
+            // Reassignment of a queued legacy run that was never claimed: it
+            // never reached its provider, so there is nothing to reconcile.
+            // Recording that lets the release drain promote the new assignee's
+            // wake parked behind it. Other gate outcomes keep their behaviour.
+            ...(expectedStatus === "queued" && decision.errorCode === "issue_assignee_changed" &&
+              isUnclaimedFirstAttempt(run)
               ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
               : {}),
             effectiveTimeoutSec: 0,

@@ -724,6 +724,71 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       });
     });
 
+    describe("no-provider-work evidence on stale cancellation", () => {
+      async function readExecutionRecovery(runId: string) {
+        const [row] = await db
+          .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        return { ...row, executionRecovery: (row?.resultJson as Record<string, unknown> | null)?.executionRecovery };
+      }
+
+      async function seedReassignedRun() {
+        const { companyId, agentId } = await seedCompanyAndAgent();
+        const replacementAgentId = randomUUID();
+        await seedAgent({ id: replacementAgentId, companyId, name: "ReplacementCoder" });
+        const issueId = randomUUID();
+        await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: replacementAgentId });
+        const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId, wakeReason: "issue_assigned" } });
+        return { companyId, agentId, issueId, runId };
+      }
+
+      it("records it for a reassigned, never-claimed first attempt", async () => {
+        const { companyId, runId } = await seedReassignedRun();
+        await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ runId, companyId, expectedStatus: "queued", now: new Date() });
+        expect(await readExecutionRecovery(runId)).toMatchObject({
+          status: "cancelled",
+          errorCode: "issue_assignee_changed",
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        });
+      });
+
+      it("does not record it for a reassigned retry of an earlier attempt", async () => {
+        const { companyId, agentId, issueId, runId } = await seedReassignedRun();
+        const sourceRunId = await seedRun({ companyId, agentId, contextSnapshot: { issueId, wakeReason: "issue_assigned" } });
+        await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, sourceRunId));
+        await db.update(heartbeatRuns)
+          .set({ retryOfRunId: sourceRunId, scheduledRetryAttempt: 1, scheduledRetryReason: "transient_failure" })
+          .where(eq(heartbeatRuns.id, runId));
+        await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ runId, companyId, expectedStatus: "queued", now: new Date() });
+        const recorded = await readExecutionRecovery(runId);
+        expect(recorded).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+        expect(recorded.executionRecovery).toBeUndefined();
+      });
+
+      it("does not record it for a reassigned run that was claimed before", async () => {
+        const { companyId, runId } = await seedReassignedRun();
+        await db.update(heartbeatRuns)
+          .set({ executionStage: "preparing", controllerBootId: randomUUID() })
+          .where(eq(heartbeatRuns.id, runId));
+        await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ runId, companyId, expectedStatus: "queued", now: new Date() });
+        const recorded = await readExecutionRecovery(runId);
+        expect(recorded).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+        expect(recorded.executionRecovery).toBeUndefined();
+      });
+
+      it("does not record it for another gate reason", async () => {
+        const { companyId, agentId } = await seedCompanyAndAgent();
+        const issueId = randomUUID();
+        await seedIssue({ companyId, issueId, status: "done", assigneeAgentId: agentId });
+        const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId, wakeReason: "issue_assigned" } });
+        await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ runId, companyId, expectedStatus: "queued", now: new Date() });
+        const recorded = await readExecutionRecovery(runId);
+        expect(recorded).toMatchObject({ status: "cancelled", errorCode: "issue_terminal_status" });
+        expect(recorded.executionRecovery).toBeUndefined();
+      });
+    });
+
     it(
       "reads the locked issue state and cancels in the same semantic transaction",
       async () => {

@@ -30,20 +30,25 @@ promotion and held the deferred wake for reconciliation.
 
 ## Changes
 
-- `server/src/routes/issues.ts`: on reassignment, look up the previous
-  assignee's queued runs for the issue. This happens before the running run is
-  stopped, because that stop frees a slot that could start one of them. Each
-  run whose wake reason shows the agent was woken as the issue's owner is
-  cancelled through the same `heartbeat.cancelRun` path used for started runs
-  (errorCode `issue_reassigned`). See "Wake-Reason Classification" below.
-  - Nothing is cancelled while the previous assignee is the current
-    participant of a pending review stage. The queued-run gate keeps those
-    runs too.
-  - Immediate recovery is suppressed. The assignee has not changed yet at this
-    point, so recovery would otherwise queue a run for the old assignee, and
-    the new wake would adopt that run.
-  - The route fails with 409 `queued_run_reassignment_stop_unconfirmed` only if
-    the run is still live after the cancel attempt.
+- `server/src/routes/issues.ts`: reassignment through the issue route.
+  - Before the running run is stopped, select the previous assignee's queued
+    legacy runs for the issue whose wake reason shows the agent was woken as
+    the issue's owner (see "Wake-Reason Classification"). The selection comes
+    first because that stop frees a slot that could start one of them.
+  - Nothing is selected while the previous assignee is the current participant
+    of a pending review stage. The queued-run gate keeps those runs too.
+  - Native runs are not selected. A native run is cancelled only through an
+    audited native session decision, which a queued run does not have yet.
+    The queued-run gate cancels it at claim instead.
+  - The selected runs are cancelled only after the issue update has committed
+    and the assignee really changed, through the same `heartbeat.cancelRun`
+    path used for started runs (errorCode `issue_reassigned`). If the update
+    fails, the queued work stays in place. Because the assignee is already the
+    new agent, the release queues no recovery for the old one and needs no
+    suppression.
+  - A cancel that fails or leaves the run live is logged and does not fail the
+    request: the reassignment has committed, and the queued-run gate cancels
+    the run and promotes the new wake.
 - `server/src/services/reassignment-ownership.ts`: the positive list of
   ownership wake reasons, and the rules for the mixed ones.
 - `server/src/services/heartbeat/queue.ts`: when the stale gate in
@@ -51,14 +56,29 @@ promotion and held the deferred wake for reconciliation.
   issue and promote the parked wakes. This uses `suppressImmediateRecovery`
   and `deferredPostCommitEffects`, because the code runs under the agent start
   lock.
-- `server/src/modules/run-dispatch/adapters/postgres.ts`: a queued legacy run
-  that the gate cancels before it ever started records
-  `executionRecovery: { kind: "bootstrap", providerWorkStarted: false }`. This
-  is the same evidence `run-lifecycle.ts` writes for that case.
-- Tests: `server/src/__tests__/heartbeat-reassign-queued-run.test.ts`. The
-  watchdog mock in `issue-agent-mutation-ownership-routes.test.ts` returned
-  another agent's running run for the new queued-run selection; it now returns
-  no rows, as a real database would.
+- `server/src/modules/run-dispatch/adapters/postgres.ts`: the gate records
+  `executionRecovery: { kind: "bootstrap", providerWorkStarted: false }` only
+  for `issue_assignee_changed` on a legacy run with no evidence of a claim, a
+  start, a process, a provider session or an earlier attempt:
+  - claim and start: `startedAt`, `executionStage`, `controllerBootId` (the
+    claim UPDATE writes the last two, `legacyControllerClaim`)
+  - process: `processPid`, `processGroupId`, `processStartedAt`
+  - provider and session: `externalRunId`, `sessionIdAfter`
+  - retry history: `retryOfRunId`, `scheduledRetryAttempt`,
+    `scheduledRetryReason`, `processLossRetryCount`
+
+  The legacy reconciliation classifier only trusts this marker after its
+  workspace-recovery and failure-retry checks, so an earlier attempt can never
+  be hidden behind it. Every other gate outcome keeps its previous behaviour.
+- Tests:
+  - `server/src/__tests__/heartbeat-reassign-queued-run.test.ts`: integration
+    tests through the real route and queue.
+  - `server/src/services/reassignment-ownership.test.ts`: the classification.
+  - `server/src/modules/run-dispatch/adapters/postgres.test.ts`: the evidence
+    marker.
+  - `issue-agent-mutation-ownership-routes.test.ts`: the watchdog mock returned
+    another agent's running run for the new queued-run selection; it now
+    returns no rows, as a real database would.
 
 ## Wake-Reason Classification
 
@@ -169,8 +189,9 @@ An independent review of the first version found the following:
 | 2 | That release ran under the agent start lock and applied its effects inline. | Fixed. Recovery is suppressed and effects are deferred. |
 | 3 | Stopping the running run could start a queued run before it was selected. | Fixed. Queued runs are selected first. |
 | 4 | A run that finished on its own made the reassignment fail with 409. | Fixed. The 409 is raised only when the run is still live. |
-| 5 | The cancel runs before the issue update. If the update fails, the old assignee's queued runs are gone and recovery was suppressed. | Open. See question 1. |
-| 6 | Native queued runs in the route cancel may block the issue during release. | Open. See question 2. |
+| 5 (F2) | The cancel runs before the issue update. If the update fails, the old assignee's queued runs are gone and recovery was suppressed. | Fixed. The cancel runs after the update commits. Tested with an update rejected after the selection; the test fails on the previous ordering. |
+| 6 (native) | Native queued runs in the route cancel may block the issue during release. | Settled. The route leaves native runs to the gate. Tested: no reconciliation hold, no recovery action, and the new assignee's wake is promoted. |
+| F3 | The bootstrap evidence was written for every queued stale-gate outcome. | Fixed. Only `issue_assignee_changed` on an unclaimed first attempt. Adapter tests cover a retry, a previously claimed run and another gate reason. |
 | 7 | Skipping all comment wakes kept the bug when the holder was an owner comment wake. | Fixed. A positive ownership list derived from the producers replaces the skip list (see below). |
 | Tests | The negative test passed even without the skip list. | Fixed. The negative test now uses the previous assignee's own `interaction_pending` wake, created through the real interaction route. The tests also assert the gate errorCode and that no recovery run is queued. |
 
@@ -214,22 +235,27 @@ cd server && runuser -u postgres -- env HOME=/tmp/pgtest-home TMPDIR=/tmp/pgtest
     passed.
   - The fifteen files of the two batches above, rerun together on this
     change: 15 files, 595 tests passed.
+- After the F2, F3 and native changes:
+  - `heartbeat-reassign-queued-run.test.ts`: 5 tests passed. The failed-update
+    test fails on the previous cancel-before-update ordering (the run is
+    cancelled with `issue_reassigned` although the update was rejected).
+  - `run-dispatch/adapters/postgres.test.ts`: 50 tests passed, including the
+    four evidence-marker cases.
+  - The full regression set was rerun on this change; see the following
+    commit.
 - `pnpm --filter @paperclipai/server typecheck` passes.
 - Not run: the full monorepo typecheck, `pnpm test:run` and `pnpm build`.
 
 ## Open Questions
 
-1. Should the queued-run cancel move after the issue update commits? That
-   would protect the old assignee's queued work if the update fails, and
-   recovery would no longer need to be suppressed. It would also change the
-   ordering the existing running-run cancel uses.
-2. For native queued runs, should the route cancel pass the same
-   `reassignmentStopConfirmed` marker as the running-run cancel, or skip native
-   runs altogether?
-3. Known gaps that this change leaves as they were:
+1. Known gaps that this change leaves as they were:
    - Reassignments with the `mcp_oauth` source skip this route block and rely
      on the stale gate. That gate needs the old agent to be invokable and to
      have a free slot.
-   - A retry that has reached the failure limit still holds promotion.
+   - A retry of an earlier attempt that the gate cancels for a reassignment
+     gets no evidence marker, so its deferred wake still waits for
+     reconciliation or the next wake.
    - The legacy fallback that adopts any queued run on the issue as the holder
      is unchanged. It is the deeper cause and affects more than reassignment.
+   - No current producer leaves a native run queued. The native test pins the
+     outcome should one appear.
