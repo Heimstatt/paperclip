@@ -1108,6 +1108,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
       if (staleness.outcome === "cancelled" || staleness.outcome === "deferred") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        if (staleness.outcome === "cancelled") {
+          // The gate cleared the issue lock but does not drain the wakes that
+          // parked behind it; release through the same path as any cancellation.
+          await releaseIssueExecutionAndPromote({ id: run.id, companyId: run.companyId });
+        }
         logger.info(
           {
             runId: run.id,

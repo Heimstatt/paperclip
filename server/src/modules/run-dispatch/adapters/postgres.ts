@@ -895,6 +895,13 @@ export function createPostgresRunDispatchAdapter(
             ...(decision.errorCode === "execution_reconciliation_required"
               ? { executionWait: decision.details }
               : {}),
+            // A queued legacy run cancelled before dispatch never reached its
+            // provider, so there is nothing to reconcile. Recording that lets the
+            // release drain promote the deferred wake parked behind it.
+            ...(expectedStatus === "queued" && decision.errorCode !== "execution_reconciliation_required" &&
+              run.runtimeMode !== "native" && !run.startedAt && !run.processPid
+              ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
+              : {}),
             effectiveTimeoutSec: 0,
             timeoutConfigured: false,
             timeoutSource: "stale_queued_run_gate",
