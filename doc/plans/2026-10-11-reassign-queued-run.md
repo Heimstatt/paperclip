@@ -6,6 +6,9 @@ assignee's wake stays deferred".
 
 - Branch: `fix/14879-reassign-queued-run`
 - Started from: `e733bddc45e00efb1819fffa8677f7b0d07802c5` (`master`)
+- Rebased onto: `04d8eaef45ac05f684487f422e158973616fff54`
+  (`fix/15483-prestart-cancel-not-reconcile`, fork PR #2, the fix for
+  paperclipai/paperclip#15483). This branch is now stacked on that fix.
 
 ## Root Cause
 
@@ -56,37 +59,92 @@ promotion and held the deferred wake for reconciliation.
   `deferredPostCommitEffects`. New service methods `cancelQueuedRunsInTx`,
   `settleCancelledQueuedRuns` and `resumeAfterDeferredCancellation` carry the
   transactional cancel and the deferred restart.
-- `server/src/services/pre-dispatch-review-wait.ts`: one shared, verified
-  pre-dispatch predicate. `hasNoDispatchEvidenceOnRow` requires a legacy run
-  with no unsafe workspace archive and every dispatch field empty:
-  `startedAt`, `runtimeModeResolvedAt`, `processPid`, `processGroupId`,
-  `processStartedAt`, `nativeIssueId`, `nativeSessionId`, `sessionIdAfter`,
-  `controllerBootId`, `controllerLeaseExpiresAt`, `executionStage`.
-  `hasVerifiedNoDispatchEvidence` adds the retained evidence: no native
-  finalization coordinator, no unreleased or unterminated environment lease,
-  no recorded execution event. The existing review-wait verifier now uses
-  both, unchanged in behaviour.
-- The transactional queued-run cancel writes the bootstrap evidence only when
-  `hasVerifiedNoDispatchEvidence` holds. Ambiguous evidence keeps the run under
-  reconciliation.
+- `server/src/services/pre-dispatch-review-wait.ts` (shared with the #15483
+  fix): one pre-dispatch cancel predicate, `isPreDispatchCancel`, with
+  `isPreDispatchCancelVerified` for the retained evidence. See "Stacking on
+  the #15483 fix" below.
+- The transactional queued-run cancel stamps a reassignment pre-dispatch
+  cancel receipt (`stopReason: "issue_reassigned"`,
+  `timeoutSource: "reassignment_queue_cancel"`) and writes no bootstrap marker
+  of its own. The shared verifier decides whether the run needs
+  reconciliation, at terminalization and at release.
 - `server/src/services/reassignment-ownership.ts`: the positive list of
   ownership wake reasons, and the rules for the mixed ones.
 - `server/src/services/heartbeat/queue.ts`: when the stale gate in
   `claimQueuedRun` cancels a run with `issue_assignee_changed`, release the
   issue and promote the parked wakes. This uses `suppressImmediateRecovery`
   and `deferredPostCommitEffects`, because the code runs under the agent start
-  lock. On this branch alone the drain promotes behind a native holder. Behind
-  a cancelled legacy holder it needs proof that the holder never started. That
-  verifier is the fix for paperclipai/paperclip#15483 (fork PR #2). Until it
-  is in, the deferred wake waits for the next wake.
-- No bootstrap marker is written by the queued-run gate on this branch. The
-  earlier marker was removed in favour of the #15483 verifier.
+  lock. With the #15483 verifier the drain promotes behind a legacy holder that
+  never started, as well as behind a native holder.
+- `server/src/modules/run-dispatch/index.ts`: exports
+  `QUEUED_RUN_STALENESS_ERROR_CODES`, so the verifier imports it through the
+  module index (`pnpm check:module-boundaries`).
 - Tests:
   - `server/src/__tests__/heartbeat-reassign-queued-run.test.ts`: integration
     tests through the real route and queue.
   - `server/src/services/reassignment-ownership.test.ts`: the classification.
   - `issue-agent-mutation-ownership-routes.test.ts`: the watchdog mock returns
     no rows for the queued-run selection, as a real database would.
+
+## Stacking on the #15483 fix
+
+### Conflict in `pre-dispatch-review-wait.ts`
+
+Both branches had built the same "never dispatched" check. The combined file
+keeps one predicate:
+
+- The #15483 version is the base: `isPreDispatchCancel`,
+  `isPreDispatchReviewWait` and `isPreDispatchCancelVerified`, with the
+  pre-dispatch codes derived from `QUEUED_RUN_STALENESS_ERROR_CODES`.
+- Underneath, the dispatch-field check and the retained-evidence check exist
+  once each, inside the module (`hasNoDispatchEvidenceOnRow`,
+  `hasVerifiedNoDispatchEvidence`). They are no longer exported.
+- The only extension is a third cancel source,
+  `reassignment_queue_cancel`, valid only with `issue_reassigned`. A source is
+  accepted only with its own codes: the queued-run gate with the staleness
+  codes except `execution_reconciliation_required`, the claim-time dependency
+  gate with `issue_dependencies_blocked`, and the reassignment cancel with
+  `issue_reassigned`.
+- Both kinds of cancel reach the predicate through the same call site:
+  `legacyExecutionNeedsReconciliationWithEvidence`, which the legacy
+  terminalization and the release pre-drain both use. The reassignment cancel
+  no longer writes its own bootstrap marker.
+- The staleness codes are read at call time, not at module load: the
+  run-dispatch index can be mid-evaluation when this module loads through an
+  import cycle.
+
+### Retry case: one behaviour
+
+Before the rebase the two branches disagreed about a queued retry that never
+ran:
+
+- The #15483 fix drops the reconciliation hold for a gate-cancelled run that
+  the verifier proves never dispatched, even when its failure-retry budget is
+  spent (`scheduledRetryAttempt >= 2`).
+- This branch wrote a bootstrap marker for the reassignment cancel. The
+  synchronous classifier checks the retry budget before the marker, so for a
+  spent budget the hold stayed. The outcome therefore depended on which path
+  cancelled the run.
+
+The combined code follows the #15483 behaviour for both paths: a verified
+never-dispatched cancel needs no reconciliation, whatever the retry count.
+
+Why:
+
+- A reconciliation hold protects against unknown provider actions of that
+  run. The verifier proves the run has none: no claim field, no lease, no
+  execution event.
+- The earlier failed attempts were classified when they themselves ended.
+  Their unknown outcomes are recorded on their own rows. Keeping a hold on
+  the cancelled retry adds no protection for them.
+- The retry budget limits automatic retries. It is enforced where retries are
+  scheduled, not by holding a run that never ran.
+- In the reassignment case, keeping the hold blocks the new assignee, which is
+  the bug this branch fixes.
+
+If the verifier sees any dispatch evidence, the hold stays, for retries and
+first attempts alike. A test covers a never-run retry with
+`scheduledRetryAttempt: 2` whose source failed with `process_lost`.
 
 ## Wake-Reason Classification
 
@@ -271,3 +329,116 @@ cd server && runuser -u postgres -- env HOME=/tmp/pgtest-home TMPDIR=/tmp/pgtest
      is unchanged. It is the deeper cause and affects more than reassignment.
    - No current producer leaves a native run queued, or a queued run beside a
      running holder on the same issue. The tests for both use fixtures.
+
+## Upstream Publication (Drafts, Not Published)
+
+Nothing in this section is published. The two pull requests are stacked:
+the reassignment change depends on the pre-dispatch cancel change.
+
+### Draft 1: pre-dispatch cancels need no reconciliation (paperclipai/paperclip#15483)
+
+Base: `master`. Commits: `490d44d`, `04d8eae`, and the module-boundary fix
+from this branch if it is moved down (see "Before publication" below).
+
+```markdown
+## Thinking Path
+
+> - Paperclip is the open source app people use to manage AI agents for work
+> - The heartbeat dispatcher cancels a queued run before it starts when the run lost its target, for example after a reassignment or while dependencies are blocked
+> - The legacy reconciliation classifier treats any cancelled legacy run without start evidence as an unknown provider failure
+> - Thus a run that never started leaves a permanent reconciliation hold on the issue, and deferred wakes do not get promoted
+> - This pull request generalizes the existing pre-dispatch review-wait receipt to every dispatcher staleness code and to the claim-time dependency gate, and it uses the evidence-backed check when it decides about reconciliation
+> - The benefit is that a dispatcher pre-start cancel releases the issue, while a run with any start evidence keeps the hold
+
+## Linked Issues or Issue Description
+
+Fixes: paperclipai/paperclip#15483
+
+## What Changed
+
+- `server/src/services/pre-dispatch-review-wait.ts`: `isPreDispatchCancel` accepts every queued-run staleness code except `execution_reconciliation_required` from the queued-run gate, and `issue_dependencies_blocked` from the claim-time dependency gate. `isPreDispatchCancelVerified` also requires no finalization coordinator, no held environment lease and no execution event. `isPreDispatchReviewWait` keeps its behaviour.
+- `server/src/services/legacy-execution-recovery.ts`: `legacyExecutionNeedsReconciliationWithEvidence` uses the verified pre-dispatch cancel check.
+- `server/src/modules/run-dispatch/domain/policy.ts`: the staleness codes are one exported list, `QUEUED_RUN_STALENESS_ERROR_CODES`. The module index exports it.
+- Tests for each staleness code, the dependency gate, a release that promotes saved input after a pre-start cancel, a never-run retry with a spent failure budget, and a cancelled run that had started.
+
+## Verification
+
+- `pnpm check:module-boundaries`
+- `cd server && npx vitest run src/services/legacy-execution-recovery.test.ts src/modules/wake-queue/adapters/postgres.test.ts src/__tests__/heartbeat-dependency-scheduling.test.ts`
+- `pnpm --filter @paperclipai/server typecheck`
+- Embedded Postgres does not start as root. Run the tests as a non-root user.
+
+## Risks
+
+- A never-run retry with a spent failure budget no longer keeps a hold. The earlier failed attempts keep their own reconciliation decisions.
+- A run with any start, process, session, lease or execution-event evidence keeps the hold.
+
+## Model Used
+
+- Claude (Anthropic) through Claude Code, with tool use and code execution.
+
+## Checklist
+
+(Fill in at publication.)
+```
+
+### Draft 2: reassignment cancels the previous assignee's queued runs (paperclipai/paperclip#14879)
+
+Base: the branch of Draft 1. Commits: every commit of this branch after
+`04d8eae`.
+
+```markdown
+## Thinking Path
+
+> - Paperclip is the open source app people use to manage AI agents for work
+> - The heartbeat queue starts agent runs and controls which run holds the execution lock of an issue
+> - When a user reassigns an issue, Paperclip stops the running run of the previous assignee, but it keeps the queued runs of that agent
+> - A queued run does not hold the issue lock. Thus the wake of the new assignee adopts the old queued run as lock holder and waits as `deferred_issue_execution`
+> - This pull request cancels the queued ownership runs of the previous assignee in the same transaction as the reassignment, and it promotes the waiting wake when the queued-run gate cancels a stale holder
+> - The benefit is that a reassignment starts the new assignee without a wait for the previous agent
+
+## Linked Issues or Issue Description
+
+Fixes: paperclipai/paperclip#14879
+
+Depends on: the pull request for paperclipai/paperclip#15483 (Draft 1).
+
+## What Changed
+
+- `server/src/routes/issues.ts`: on reassignment, select the queued legacy runs of the previous assignee whose wake reason shows ownership. Stopping the running run does not start that agent's queue until the response ends. The selected runs are cancelled as the last step of the issue update transaction. A rejected update keeps them queued. A run that another path started rolls the update back with 409.
+- `server/src/services/reassignment-ownership.ts`: a positive list of ownership wake reasons, derived from the producers of each reason.
+- `server/src/services/heartbeat.ts`, `heartbeat/run-control.ts`, `heartbeat/run-lifecycle.ts`: `cancelRun` accepts `deferredPostCommitEffects`; new methods `cancelQueuedRunsInTx`, `settleCancelledQueuedRuns` and `resumeAfterDeferredCancellation`.
+- `server/src/services/pre-dispatch-review-wait.ts`: a reassignment cancel source, `reassignment_queue_cancel`, valid only with `issue_reassigned`. The shared verifier decides about reconciliation for this cancel too.
+- `server/src/services/heartbeat/queue.ts`: when the queued-run gate cancels a run because the assignee changed, release the issue and promote the waiting wakes.
+- Tests through the real route and queue, a classification unit test, and one evidence test for each dispatch field.
+
+## Verification
+
+- `pnpm check:module-boundaries`
+- `cd server && npx vitest run src/__tests__/heartbeat-reassign-queued-run.test.ts src/services/reassignment-ownership.test.ts src/services/legacy-execution-recovery.test.ts`
+- `pnpm --filter @paperclipai/server typecheck`
+- Embedded Postgres does not start as root. Run the tests as a non-root user.
+
+## Risks
+
+- A claim from another path between the stop of the active run and the update commit makes the reassignment fail with 409.
+- Reassignments with the `mcp_oauth` source skip the route block and depend on the queued-run gate.
+- Two test states have no current natural producer: a native queued run, and a queued run beside a running holder on the same issue. These tests use fixtures.
+
+## Model Used
+
+- Claude (Anthropic) through Claude Code, with tool use and code execution.
+
+## Checklist
+
+(Fill in at publication.)
+```
+
+### Before publication
+
+- The module-boundary violation is in the #15483 code (`pre-dispatch-review-wait.ts`
+  imports `run-dispatch/domain/policy.js`). On this branch it is fixed in a
+  later commit. For Draft 1 to pass `pnpm check:module-boundaries` on its own,
+  that fix must move to the #15483 branch.
+- The commits listed below carry `Claude-Session` lines. Remove them before
+  publication by rewriting history; that is not done yet.
