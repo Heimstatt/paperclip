@@ -1,5 +1,6 @@
 import { and, eq, inArray, isNotNull, or } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { QUEUED_RUN_STALENESS_ERROR_CODES } from "../modules/run-dispatch/domain/policy.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
@@ -8,16 +9,31 @@ type DispatchFields = "startedAt" | "runtimeModeResolvedAt" | "processPid" | "pr
   "processStartedAt" | "nativeIssueId" | "nativeSessionId" | "sessionIdAfter" |
   "controllerBootId" | "controllerLeaseExpiresAt" | "executionStage";
 
+/** Every queued-run staleness code is a pre-dispatch cancel except
+ * `execution_reconciliation_required`, which reports an existing hold rather
+ * than a run that merely lost its target. Derived so a new code is a decision. */
+const PRE_DISPATCH_CANCEL_CODES: ReadonlySet<string> = new Set(
+  QUEUED_RUN_STALENESS_ERROR_CODES.filter(code => code !== "execution_reconciliation_required"),
+);
+
+/** The dispatcher gate and the claim-time dependency gate both cancel a queued
+ * run before any execution authority is claimed; each stamps its own source. */
+function hasPreDispatchCancelSource(run: Pick<Run, "errorCode" | "resultJson">): boolean {
+  const source = run.resultJson?.timeoutSource;
+  return source === "stale_queued_run_gate" ||
+    (source === "dependency_gate" && run.errorCode === "issue_dependencies_blocked");
+}
+
 /** The queued-run gate owns this receipt before execution authority is claimed.
- * A deliberate review wait has no provider actions to reconcile. The error code
- * alone is not proof; missing or conflicting dispatch evidence retains the hold. */
-export function isPreDispatchReviewWait(
+ * A run it cancelled has no provider actions to reconcile. The error code alone
+ * is not proof; missing or conflicting dispatch evidence retains the hold. */
+export function isPreDispatchCancel(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
 ): boolean {
   return run.runtimeMode === "legacy" && run.status === "cancelled" &&
-    run.errorCode === "issue_continuation_waiting_on_review" &&
+    run.errorCode != null && PRE_DISPATCH_CANCEL_CODES.has(run.errorCode) &&
     run.resultJson?.stopReason === run.errorCode &&
-    run.resultJson?.timeoutSource === "stale_queued_run_gate" &&
+    hasPreDispatchCancelSource(run) &&
     run.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive" &&
     run.startedAt === null && run.runtimeModeResolvedAt === null &&
     run.processPid === null && run.processGroupId === null && run.processStartedAt === null &&
@@ -25,11 +41,19 @@ export function isPreDispatchReviewWait(
     run.controllerBootId === null && run.controllerLeaseExpiresAt === null && run.executionStage === null;
 }
 
+/** A deliberate review wait is the one pre-dispatch cancel that also changes
+ * operator-facing copy and native startup admission. */
+export function isPreDispatchReviewWait(
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
+): boolean {
+  return run.errorCode === "issue_continuation_waiting_on_review" && isPreDispatchCancel(run);
+}
+
 /** The row receipt is a candidate, not permission to discard conflicting
  * retained execution or cleanup evidence. Historical false holds must be
  * checked against the same evidence that gates explicit user admission. */
-export async function isPreDispatchReviewWaitVerified(db: Db, run: Run): Promise<boolean> {
-  if (!isPreDispatchReviewWait(run)) return false;
+export async function isPreDispatchCancelVerified(db: Db, run: Run): Promise<boolean> {
+  if (!isPreDispatchCancel(run)) return false;
   const [coordinator] = await db.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
     eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
   )).limit(1);
