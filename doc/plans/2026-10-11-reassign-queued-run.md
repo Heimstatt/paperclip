@@ -212,8 +212,8 @@ cd server && runuser -u postgres -- env HOME=/tmp/pgtest-home TMPDIR=/tmp/pgtest
   - `reassignment-ownership.test.ts`, `heartbeat-reassign-queued-run.test.ts`
     and `issue-agent-mutation-ownership-routes.test.ts`: 3 files, 151 tests
     passed.
-  - The two batches above were rerun on this change; see the following
-    commit.
+  - The fifteen files of the two batches above, rerun together on this
+    change: 15 files, 595 tests passed.
 - `pnpm --filter @paperclipai/server typecheck` passes.
 - Not run: the full monorepo typecheck, `pnpm test:run` and `pnpm build`.
 
