@@ -305,6 +305,20 @@ cd server && runuser -u postgres -- env HOME=/tmp/pgtest-home TMPDIR=/tmp/pgtest
   from Sentry diagnostics: result", also fails with the base versions of
   every changed source file, so it is not caused by this branch.
 - `pnpm --filter @paperclipai/server typecheck` passes.
+- After the rebase onto the #15483 fix (`04d8eae`), at head `f7a3ab7`:
+  - `pnpm check:module-boundaries`: passes. On `04d8eae` alone it fails
+    (`pre-dispatch-review-wait.ts` imports `run-dispatch/domain/policy.js`);
+    this branch imports through the module index.
+  - `pnpm --filter @paperclipai/server typecheck`: passes.
+  - Focused tests of both branches plus the regression set, 24 files:
+    1282 of 1283 tests pass. The #15483 files are
+    `legacy-execution-recovery.test.ts`, `wake-queue/adapters/postgres.test.ts`
+    and `heartbeat-dependency-scheduling.test.ts`. The one failure is the
+    `heartbeat-process-recovery` Sentry redaction test. It also fails with the
+    `04d8eae` versions of every source file this branch changes, and with the
+    `e733bdd` versions, so neither branch causes it.
+  - `heartbeat-reassign-queued-run.test.ts`: 23 tests pass (the gate test was
+    corrected after the first run of the set, then rerun alone).
 - Not run: the full monorepo typecheck, `pnpm test:run` and `pnpm build`.
 - GitHub Actions do not run on this fork.
 
@@ -442,3 +456,30 @@ Depends on: the pull request for paperclipai/paperclip#15483 (Draft 1).
   that fix must move to the #15483 branch.
 - The commits listed below carry `Claude-Session` lines. Remove them before
   publication by rewriting history; that is not done yet.
+
+### Commits that carry a `Claude-Session` line
+
+All commits of the stack above `master` (`e733bdd`) carry one. Their
+`Co-Authored-By` lines also name a model. Both must be removed before
+publication; history is not rewritten yet.
+
+| Commit | Subject | Session |
+|---|---|---|
+| `490d44d` | fix(server): dispatcher pre-start cancels no longer require reconciliation | the #15483 session |
+| `04d8eae` | fix(server): cover claim-time dependency cancel and tighten pre-dispatch receipt | the #15483 session |
+| `e9a447e` | Cancel previous assignee's queued runs on reassignment | this session |
+| `27afab6` | Keep watchdog reassignment mock free of queued runs | this session |
+| `3d34342` | Narrow stale-gate promotion and harden reassignment cancel | this session |
+| `021b3d4` | Add notes for the reassignment queued-run fix | this session |
+| `61cb705` | Cancel only queued runs woken as the issue owner on reassignment | this session |
+| `b70cf63` | Record regression results for the ownership classification | this session |
+| `30c3294` | Cancel queued runs after the reassignment commits; narrow evidence | this session |
+| `8bf1235` | Record regression results for the post-commit cancel change | this session |
+| `2598ed3` | Fence the old assignee's queue and cancel queued runs atomically | this session |
+| `6242e57` | Hold the agent queue only when a start was deferred | this session |
+| `77286ca` | Record verification for the queue fence and atomic cancel | this session |
+| `d196dbf` | Gate the queued-cancel bootstrap evidence on a verified predicate | this session |
+| `47d33a8` | Record verification for the shared pre-dispatch predicate | this session |
+| `7ffe943` | Use the #15483 pre-dispatch verifier for the reassignment cancel | this session |
+| `f7a3ab7` | Expect the promoted run to take the lock after the gate cancel | this session |
+| (next) | the commit that adds this list | this session |
