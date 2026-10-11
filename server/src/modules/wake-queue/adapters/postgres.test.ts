@@ -456,6 +456,42 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(2);
   });
 
+  describe("dispatcher-cancelled run that never started", () => {
+    const seedCancelled = async (errorCode: string, started: boolean) => {
+      const companyId = await seedCompany(), agentId = await seedAgent({ companyId });
+      const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+      const runId = await seedRun({ companyId, agentId, status: "cancelled", contextSnapshot: { issueId }, errorCode });
+      await db.update(heartbeatRuns).set({
+        finishedAt: new Date(Date.now() - 1000),
+        ...(started ? { startedAt: new Date(Date.now() - 5000), processPid: 4321, sessionIdAfter: "provider-session" } : {}),
+        resultJson: { stopReason: errorCode, timeoutSource: "stale_queued_run_gate" },
+      }).where(eq(heartbeatRuns.id, runId));
+      const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user",
+        authorUserId: "responsible-user", body: "Continue with this new message." }).returning();
+      const wakeId = await seedDeferredWake({ companyId, agentId, issueId, requestedByActorId: "responsible-user",
+        payload: { commentId: comment.id, _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [comment.id] } } });
+      const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+        recovery: { escalateStrandedAssignedIssue: async () => {}, escalateStrandedRecoveryIssueInPlace: async () => {} } });
+      const result = await release({ companyId, runId, now: new Date() });
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+      return { companyId, result, wake };
+    };
+
+    it.each(["issue_assignee_changed", "issue_dependencies_blocked"])("promotes saved input after a %s cancel before start", async errorCode => {
+      const { companyId, result, wake } = await seedCancelled(errorCode, false);
+      expect(result.outcome.kind).toBe("promoted");
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(2);
+      expect(wake.runId).not.toBeNull();
+    });
+
+    it("keeps the hold when the cancelled run had started", async () => {
+      const { companyId, result, wake } = await seedCancelled("issue_assignee_changed", true);
+      expect(result.outcome.kind).toBe("released");
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+      expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    });
+  });
+
   it("leaves deferred work untouched until the effective execution hold clears", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent({ companyId });
