@@ -24,16 +24,13 @@ function hasPreDispatchCancelSource(run: Pick<Run, "errorCode" | "resultJson">):
     (source === "dependency_gate" && run.errorCode === "issue_dependencies_blocked");
 }
 
-/** The queued-run gate owns this receipt before execution authority is claimed.
- * A run it cancelled has no provider actions to reconcile. The error code alone
- * is not proof; missing or conflicting dispatch evidence retains the hold. */
-export function isPreDispatchCancel(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
+/** True only when the run row carries no evidence that execution authority
+ * was ever claimed: a legacy run with every dispatch field still empty and no
+ * unsafe workspace archive. Any missing or conflicting field fails closed. */
+export function hasNoDispatchEvidenceOnRow(
+  run: Pick<Run, "runtimeMode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
 ): boolean {
-  return run.runtimeMode === "legacy" && run.status === "cancelled" &&
-    run.errorCode != null && PRE_DISPATCH_CANCEL_CODES.has(run.errorCode) &&
-    run.resultJson?.stopReason === run.errorCode &&
-    hasPreDispatchCancelSource(run) &&
+  return run.runtimeMode === "legacy" &&
     run.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive" &&
     run.startedAt === null && run.runtimeModeResolvedAt === null &&
     run.processPid === null && run.processGroupId === null && run.processStartedAt === null &&
@@ -41,19 +38,12 @@ export function isPreDispatchCancel(
     run.controllerBootId === null && run.controllerLeaseExpiresAt === null && run.executionStage === null;
 }
 
-/** A deliberate review wait is the one pre-dispatch cancel that also changes
- * operator-facing copy and native startup admission. */
-export function isPreDispatchReviewWait(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
-): boolean {
-  return run.errorCode === "issue_continuation_waiting_on_review" && isPreDispatchCancel(run);
-}
-
-/** The row receipt is a candidate, not permission to discard conflicting
- * retained execution or cleanup evidence. Historical false holds must be
- * checked against the same evidence that gates explicit user admission. */
-export async function isPreDispatchCancelVerified(db: Db, run: Run): Promise<boolean> {
-  if (!isPreDispatchCancel(run)) return false;
+/** The row check is a candidate, not permission to discard conflicting
+ * retained execution or cleanup evidence: a finalization coordinator, an
+ * unreleased or unterminated environment lease, or a recorded execution event
+ * each mean the run may have reached its provider. */
+export async function hasVerifiedNoDispatchEvidence(db: Db, run: Run): Promise<boolean> {
+  if (!hasNoDispatchEvidenceOnRow(run)) return false;
   const [coordinator] = await db.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
     eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
   )).limit(1);
@@ -72,4 +62,32 @@ export async function isPreDispatchCancelVerified(db: Db, run: Run): Promise<boo
         "provider.event", "provider.rpc_result", "tool.execution.started"])),
   )).limit(1);
   return !execution;
+}
+
+/** The queued-run gate owns this receipt before execution authority is claimed.
+ * A run it cancelled has no provider actions to reconcile. The error code alone
+ * is not proof; missing or conflicting dispatch evidence retains the hold. */
+export function isPreDispatchCancel(
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
+): boolean {
+  return run.status === "cancelled" &&
+    run.errorCode != null && PRE_DISPATCH_CANCEL_CODES.has(run.errorCode) &&
+    run.resultJson?.stopReason === run.errorCode &&
+    hasPreDispatchCancelSource(run) &&
+    hasNoDispatchEvidenceOnRow(run);
+}
+
+/** A deliberate review wait is the one pre-dispatch cancel that also changes
+ * operator-facing copy and native startup admission. */
+export function isPreDispatchReviewWait(
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
+): boolean {
+  return run.errorCode === "issue_continuation_waiting_on_review" && isPreDispatchCancel(run);
+}
+
+/** The row receipt is a candidate, not permission to discard conflicting
+ * retained execution or cleanup evidence. Historical false holds must be
+ * checked against the same evidence that gates explicit user admission. */
+export async function isPreDispatchCancelVerified(db: Db, run: Run): Promise<boolean> {
+  return isPreDispatchCancel(run) && await hasVerifiedNoDispatchEvidence(db, run);
 }

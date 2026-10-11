@@ -56,6 +56,19 @@ promotion and held the deferred wake for reconciliation.
   `deferredPostCommitEffects`. New service methods `cancelQueuedRunsInTx`,
   `settleCancelledQueuedRuns` and `resumeAfterDeferredCancellation` carry the
   transactional cancel and the deferred restart.
+- `server/src/services/pre-dispatch-review-wait.ts`: one shared, verified
+  pre-dispatch predicate. `hasNoDispatchEvidenceOnRow` requires a legacy run
+  with no unsafe workspace archive and every dispatch field empty:
+  `startedAt`, `runtimeModeResolvedAt`, `processPid`, `processGroupId`,
+  `processStartedAt`, `nativeIssueId`, `nativeSessionId`, `sessionIdAfter`,
+  `controllerBootId`, `controllerLeaseExpiresAt`, `executionStage`.
+  `hasVerifiedNoDispatchEvidence` adds the retained evidence: no native
+  finalization coordinator, no unreleased or unterminated environment lease,
+  no recorded execution event. The existing review-wait verifier now uses
+  both, unchanged in behaviour.
+- The transactional queued-run cancel writes the bootstrap evidence only when
+  `hasVerifiedNoDispatchEvidence` holds. Ambiguous evidence keeps the run under
+  reconciliation.
 - `server/src/services/reassignment-ownership.ts`: the positive list of
   ownership wake reasons, and the rules for the mixed ones.
 - `server/src/services/heartbeat/queue.ts`: when the stale gate in
@@ -188,6 +201,7 @@ An independent review of the first version found the following:
 | F2, round 3 | Stopping the active run starts the old agent's queue, so a selected queued run can be claimed before the reassignment commits. | Fixed. The stop defers the agent's queue start until the response ends, and the cancel is atomic with the update. Tested with a queued run that becomes claimable during the stop; on the previous code the stop sends it through the claim path before the commit. A direct test shows a run claimed by another path rolls the update back. |
 | 6 (native) | Native queued runs in the route cancel may block the issue during release. | Settled. The route leaves native runs to the gate. Tested: no reconciliation hold, no recovery action, and the new assignee's wake is promoted. |
 | F3 | The bootstrap evidence was written for every queued stale-gate outcome. | Resolved by removal (round 3 decision). The gate writes no marker on this branch; the #15483 verifier decides. The stale-gate test now asserts only what this branch guarantees. |
+| F3, transactional cancel | The transactional queued-run cancel wrote the bootstrap evidence when only `startedAt` and `processPid` were empty. | Fixed. It uses the shared verified pre-dispatch predicate. Negative tests cover each row field, an unsafe archive, a held lease and an execution event; 12 of them fail on the previous condition. A coordinator implies `nativeIssueId` through its foreign key, so the `nativeIssueId` case covers it. |
 | 7 | Skipping all comment wakes kept the bug when the holder was an owner comment wake. | Fixed. A positive ownership list derived from the producers replaces the skip list (see below). |
 | Tests | The negative test passed even without the skip list. | Fixed. The negative test now uses the previous assignee's own `interaction_pending` wake, created through the real interaction route. The tests also assert the gate errorCode and that no recovery run is queued. |
 
@@ -231,7 +245,13 @@ cd server && runuser -u postgres -- env HOME=/tmp/pgtest-home TMPDIR=/tmp/pgtest
 
 ## Open Questions
 
-1. Known gaps that this change leaves as they were:
+1. `setRunStatus` and `setRunStatusFromLive` in
+   `server/src/services/heartbeat/run-lifecycle.ts` predate this branch and
+   still write the bootstrap evidence for any cancelled queued non-native run
+   with empty `startedAt` and `processPid`. Should they use the shared
+   verified predicate too? That changes behaviour for every queued-run cancel,
+   not only reassignment.
+2. Known gaps that this change leaves as they were:
    - Behind a cancelled legacy holder, the deferred wake is promoted only with
      the #15483 verifier. On this branch alone it waits for the next wake.
    - Reassignments with the `mcp_oauth` source skip this route block and rely
