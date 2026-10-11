@@ -14277,15 +14277,19 @@ export function issueRoutes(
       // run must not start that agent's queue: a selected queued run would be
       // claimed under the old assignment. Starts resume once the response ends.
       const reassignmentQueueFence: Parameters<typeof heartbeat.resumeAfterDeferredCancellation>[1] = [];
-      if (req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
-        const fencedAgentId = existing.assigneeAgentId;
+      let fencedQueueAgentId: string | null = null;
+      const holdAgentQueueUntilResponseEnds = (agentId: string) => {
+        if (fencedQueueAgentId) return;
+        fencedQueueAgentId = agentId;
         res.once("close", () => {
           void heartbeat
-            .resumeAfterDeferredCancellation(fencedAgentId, reassignmentQueueFence.splice(0))
+            .resumeAfterDeferredCancellation(agentId, reassignmentQueueFence.splice(0))
             .catch((err) => {
-              logger.warn({ err, agentId: fencedAgentId, issueId: existing.id }, "failed to resume agent queue after reassignment");
+              logger.warn({ err, agentId, issueId: existing.id }, "failed to resume agent queue after reassignment");
             });
         });
+      };
+      if (req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
@@ -14333,6 +14337,7 @@ export function issueRoutes(
         }
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
         if (runToStopForReassignment) {
+          holdAgentQueueUntilResponseEnds(existing.assigneeAgentId);
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
@@ -14704,12 +14709,15 @@ export function issueRoutes(
 
       // The queued runs were cancelled with the reassignment; finish their
       // event, wake and release side effects now that it has committed.
-      await heartbeat.settleCancelledQueuedRuns(cancelledReassignmentRuns, {
-        reason: "Cancelled by issue reassignment",
-        eventMessage: "queued run cancelled by issue reassignment",
-        eventPayload: { issueId: existing.id },
-        deferredPostCommitEffects: reassignmentQueueFence,
-      });
+      if (cancelledReassignmentRuns.length > 0) {
+        holdAgentQueueUntilResponseEnds(cancelledReassignmentRuns[0]!.updated.agentId);
+        await heartbeat.settleCancelledQueuedRuns(cancelledReassignmentRuns, {
+          reason: "Cancelled by issue reassignment",
+          eventMessage: "queued run cancelled by issue reassignment",
+          eventPayload: { issueId: existing.id },
+          deferredPostCommitEffects: reassignmentQueueFence,
+        });
+      }
 
       if (enteringBlocked) {
         const blockedIssue = issue;
