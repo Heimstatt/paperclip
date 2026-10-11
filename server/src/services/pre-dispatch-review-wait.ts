@@ -1,5 +1,6 @@
 import { and, eq, inArray, isNotNull, or } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { QUEUED_RUN_STALENESS_ERROR_CODES } from "../modules/run-dispatch/domain/policy.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
@@ -8,14 +9,23 @@ type DispatchFields = "startedAt" | "runtimeModeResolvedAt" | "processPid" | "pr
   "processStartedAt" | "nativeIssueId" | "nativeSessionId" | "sessionIdAfter" |
   "controllerBootId" | "controllerLeaseExpiresAt" | "executionStage" | "contextSnapshot";
 
-/** Queued-run staleness codes written by the dispatcher gate before a run is
- * claimed. `execution_reconciliation_required` is excluded: it reports an
- * existing hold rather than a run that merely lost its target. */
-const PRE_DISPATCH_CANCEL_CODES: ReadonlySet<string> = new Set([
-  "issue_dependencies_blocked", "issue_not_found", "issue_assignee_changed", "issue_terminal_status",
-  "issue_not_in_progress", "issue_execution_lock_changed", "issue_blocked", "issue_review_participant_changed",
-  "issue_continuation_waiting_on_review",
-]);
+/** Every queued-run staleness code is a pre-dispatch cancel except
+ * `execution_reconciliation_required`, which reports an existing hold rather
+ * than a run that merely lost its target, and `issue_waiting_for_response`,
+ * which also needs its connection-intent snapshot (see below). Derived so a
+ * new code is a decision. */
+const PRE_DISPATCH_CANCEL_CODES: ReadonlySet<string> = new Set(
+  QUEUED_RUN_STALENESS_ERROR_CODES.filter(code =>
+    code !== "execution_reconciliation_required" && code !== "issue_waiting_for_response"),
+);
+
+/** The dispatcher gate and the claim-time dependency gate both cancel a queued
+ * run before any execution authority is claimed; each stamps its own source. */
+function hasPreDispatchCancelSource(run: Pick<Run, "errorCode" | "resultJson">): boolean {
+  const source = run.resultJson?.timeoutSource;
+  return source === "stale_queued_run_gate" ||
+    (source === "dependency_gate" && run.errorCode === "issue_dependencies_blocked");
+}
 
 /** A connection response wait is a pre-dispatch cancel only with the resolved
  * connection-intent snapshot; the error code alone does not qualify. */
@@ -41,7 +51,7 @@ export function isPreDispatchCancel(
   return run.runtimeMode === "legacy" && run.status === "cancelled" &&
     (isConnectionResponseWait(run) || (run.errorCode != null && PRE_DISPATCH_CANCEL_CODES.has(run.errorCode))) &&
     run.resultJson?.stopReason === run.errorCode &&
-    run.resultJson?.timeoutSource === "stale_queued_run_gate" &&
+    hasPreDispatchCancelSource(run) &&
     run.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive" &&
     (finalResponseWait || (run.startedAt === null && run.runtimeModeResolvedAt === null)) &&
     run.processPid === null && run.processGroupId === null && run.processStartedAt === null &&
