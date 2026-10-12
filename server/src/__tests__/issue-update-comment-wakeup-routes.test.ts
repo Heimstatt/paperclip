@@ -226,6 +226,9 @@ async function createApp(transaction: (callback: (tx: Record<string, never>) => 
   });
   app.use("/api", issueRoutes({
     transaction,
+    // A reassignment looks up the previous assignee's queued runs; these
+    // fixtures have none.
+    select: () => ({ from: () => ({ where: async () => [] }) }),
   } as any, {} as any));
   app.use(errorHandler);
   return app;

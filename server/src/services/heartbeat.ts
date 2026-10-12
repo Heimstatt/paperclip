@@ -354,7 +354,7 @@ import {
   projects,
   projectWorkspaces,
 } from "@paperclipai/db";
-import { HttpError, notFound } from "../errors.js";
+import { HttpError, conflict, notFound } from "../errors.js";
 
 import { logger } from "../middleware/logger.js";
 import {
@@ -5291,6 +5291,79 @@ export function heartbeatService(
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) =>
       cancelRunInternal(runId, reason, options),
+
+    /**
+     * Cancels queued legacy runs inside the caller's transaction, so they are
+     * cancelled exactly when the caller's write commits. A run that already
+     * started raises a conflict and rolls the caller's write back; a run that
+     * already ended is skipped. Call this last in the transaction, then pass
+     * the result to settleCancelledQueuedRuns after commit.
+     */
+    cancelQueuedRunsInTx: async (
+      tx: Db,
+      runIds: string[],
+      input: { reason: string; errorCode: string },
+    ) => {
+      const cancelled: Array<{ previous: typeof heartbeatRuns.$inferSelect; updated: typeof heartbeatRuns.$inferSelect }> = [];
+      for (const runId of runIds) {
+        const result = await runLifecycle.cancelQueuedLegacyRunInTx(tx, runId, input);
+        if (result) {
+          cancelled.push(result);
+          continue;
+        }
+        const [current] = await tx
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        if (current && !isHeartbeatRunTerminalStatus(current.status)) {
+          throw conflict("A queued agent run started before it could be cancelled", {
+            code: "queued_run_started_before_cancel",
+            runId,
+            status: current.status,
+          });
+        }
+      }
+      return cancelled;
+    },
+
+    /** Completes, after commit, the cancellations from cancelQueuedRunsInTx. */
+    settleCancelledQueuedRuns: async (
+      cancelled: Array<{ previous: typeof heartbeatRuns.$inferSelect; updated: typeof heartbeatRuns.$inferSelect }>,
+      input: {
+        reason: string;
+        eventMessage: string;
+        eventPayload?: Record<string, unknown>;
+        deferredPostCommitEffects?: WakeQueuePostCommitEffect[];
+      },
+    ) => {
+      for (const { previous, updated } of cancelled) {
+        runLifecycle.publishRunStatusChange(updated, previous.status);
+        await setWakeupStatus(updated.wakeupRequestId, "cancelled", {
+          finishedAt: updated.finishedAt ?? new Date(),
+          error: input.reason,
+        });
+        await appendRunEvent(updated, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: input.eventMessage,
+          payload: input.eventPayload,
+        });
+        await releaseIssueExecutionAndPromote(updated, {
+          deferredPostCommitEffects: input.deferredPostCommitEffects,
+        });
+        await finalizeAgentStatus(updated.agentId, "cancelled");
+      }
+    },
+
+    /** Applies effects deferred by cancelRun and restarts the agent's queue. */
+    resumeAfterDeferredCancellation: async (
+      agentId: string,
+      effects: WakeQueuePostCommitEffect[],
+    ) => {
+      await applyWakeQueuePostCommitEffects(effects);
+      await startNextQueuedRunForAgent(agentId);
+    },
 
     /**
      * Pause-only. Emits errorCode "agent_paused" unconditionally; its sole caller is the

@@ -33,6 +33,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+  resumeAfterDeferredCancellation: vi.fn(async () => undefined),
 }));
 
 const mockAgentService = vi.hoisted(() => ({
@@ -2757,6 +2758,10 @@ describe("issue comment reopen routes", () => {
       });
 
     expect(res.status).toBe(200);
+    // The reassignment held the previous assignee's queue; the handler, not
+    // the response, releases it once it has finished.
+    await vi.waitFor(() => expect(mockHeartbeatService.resumeAfterDeferredCancellation)
+      .toHaveBeenCalledWith("22222222-2222-4222-8222-222222222222", expect.any(Array)));
     expect(mockHeartbeatService.getRun).toHaveBeenCalledWith("run-1");
     expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
       "run-1",

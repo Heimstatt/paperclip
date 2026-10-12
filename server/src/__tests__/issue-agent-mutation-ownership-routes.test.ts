@@ -2734,6 +2734,9 @@ describe("agent issue mutation checkout ownership", () => {
       const rowsForSelection = (selection: Record<string, unknown>) => {
         const keys = Object.keys(selection);
         if (keys.includes("entityId")) return [];
+        // The previous assignee has no queued runs to cancel on reassignment;
+        // the watchdog run belongs to another agent and is not queued.
+        if (keys.includes("retryOfRunId")) return [];
         if (keys.includes("contextSnapshot")) return runRows;
         if (keys.includes("watchdogAgentId")) return watchdogRows;
         if (keys.includes("parentId")) return ancestryRows;
