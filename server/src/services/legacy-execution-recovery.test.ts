@@ -133,8 +133,24 @@ it.each(QUEUED_RUN_STALENESS_ERROR_CODES)("classifies staleness code %s delibera
     processStartedAt: null, nativeIssueId: null, nativeSessionId: null, sessionIdAfter: null,
     controllerBootId: null, controllerLeaseExpiresAt: null, executionStage: null,
     resultJson: { stopReason: errorCode, timeoutSource: "stale_queued_run_gate" } };
-  // Only a code reporting an already-recorded hold is not a pre-dispatch cancel.
-  expect(isPreDispatchCancel(run)).toBe(errorCode !== "execution_reconciliation_required");
+  // A code reporting an already-recorded hold is not a pre-dispatch cancel. A
+  // response wait needs its connection-intent snapshot, so the code alone fails.
+  expect(isPreDispatchCancel(run)).toBe(
+    errorCode !== "execution_reconciliation_required" && errorCode !== "issue_waiting_for_response");
+});
+
+it("accepts a response wait only with its resolved connection-intent snapshot", () => {
+  const contextSnapshot = { connectionIntentResolution: "existing_connection", source: "connection_intent.resolved",
+    interactionKind: "connection_intent", interactionStatus: "expired", mutation: "interaction", interactionId: "i-1" };
+  const run = { runtimeMode: "legacy", status: "cancelled", errorCode: "issue_waiting_for_response",
+    startedAt: null, runtimeModeResolvedAt: null, processPid: null, processGroupId: null,
+    processStartedAt: null, nativeIssueId: null, nativeSessionId: null, sessionIdAfter: null,
+    controllerBootId: null, controllerLeaseExpiresAt: null, executionStage: null, contextSnapshot,
+    resultJson: { stopReason: "issue_waiting_for_response", timeoutSource: "stale_queued_run_gate" } };
+  expect(isPreDispatchCancel(run)).toBe(true);
+  expect(isPreDispatchReviewWait(run)).toBe(true);
+  expect(isPreDispatchCancel({ ...run, contextSnapshot: { ...contextSnapshot, interactionStatus: "pending" } })).toBe(false);
+  expect(isPreDispatchCancel({ ...run, resultJson: { ...run.resultJson, timeoutSource: "dependency_gate" } })).toBe(false);
 });
 
 it("accepts the claim-time dependency gate source only for its own code", () => {
