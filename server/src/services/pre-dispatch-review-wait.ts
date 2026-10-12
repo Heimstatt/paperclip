@@ -1,6 +1,6 @@
 import { and, eq, inArray, isNotNull, or } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
-import { QUEUED_RUN_STALENESS_ERROR_CODES } from "../modules/run-dispatch/domain/policy.js";
+import { QUEUED_RUN_STALENESS_ERROR_CODES } from "../modules/run-dispatch/index.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
@@ -13,11 +13,12 @@ type DispatchFields = "startedAt" | "runtimeModeResolvedAt" | "processPid" | "pr
  * `execution_reconciliation_required`, which reports an existing hold rather
  * than a run that merely lost its target, and `issue_waiting_for_response`,
  * which also needs its connection-intent snapshot (see below). Derived so a
- * new code is a decision. */
-const PRE_DISPATCH_CANCEL_CODES: ReadonlySet<string> = new Set(
-  QUEUED_RUN_STALENESS_ERROR_CODES.filter(code =>
-    code !== "execution_reconciliation_required" && code !== "issue_waiting_for_response"),
-);
+ * new code is a decision. Read at call time: the run-dispatch index can be
+ * mid-evaluation when this module loads through an import cycle. */
+function isPreDispatchCancelCode(code: string): boolean {
+  return code !== "execution_reconciliation_required" && code !== "issue_waiting_for_response" &&
+    (QUEUED_RUN_STALENESS_ERROR_CODES as readonly string[]).includes(code);
+}
 
 /** The dispatcher gate and the claim-time dependency gate both cancel a queued
  * run before any execution authority is claimed; each stamps its own source. */
@@ -49,7 +50,7 @@ export function isPreDispatchCancel(
     (run.resultJson?.preDispatchResponseWait as { version?: number; providerWorkStarted?: boolean } | undefined)?.version === 1 &&
     (run.resultJson?.preDispatchResponseWait as { providerWorkStarted?: boolean } | undefined)?.providerWorkStarted === false;
   return run.runtimeMode === "legacy" && run.status === "cancelled" &&
-    (isConnectionResponseWait(run) || (run.errorCode != null && PRE_DISPATCH_CANCEL_CODES.has(run.errorCode))) &&
+    (isConnectionResponseWait(run) || (run.errorCode != null && isPreDispatchCancelCode(run.errorCode))) &&
     run.resultJson?.stopReason === run.errorCode &&
     hasPreDispatchCancelSource(run) &&
     run.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive" &&
