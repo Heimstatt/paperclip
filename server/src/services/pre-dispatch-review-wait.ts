@@ -12,9 +12,10 @@ type DispatchFields = "startedAt" | "runtimeModeResolvedAt" | "processPid" | "pr
 /** Every queued-run staleness code is a pre-dispatch cancel except
  * `execution_reconciliation_required`, which reports an existing hold rather
  * than a run that merely lost its target, and `issue_waiting_for_response`,
- * which also needs its connection-intent snapshot (see below). Derived so a
- * new code is a decision. Read at call time: the run-dispatch index can be
- * mid-evaluation when this module loads through an import cycle. */
+ * which also needs its connection-intent snapshot (see below). Derived from
+ * the staleness code list, so a new code is accepted unless it is excluded
+ * here. Read at call time: the run-dispatch index can be mid-evaluation when
+ * this module loads through an import cycle. */
 function isPreDispatchCancelCode(code: string): boolean {
   return code !== "execution_reconciliation_required" && code !== "issue_waiting_for_response" &&
     (QUEUED_RUN_STALENESS_ERROR_CODES as readonly string[]).includes(code);
