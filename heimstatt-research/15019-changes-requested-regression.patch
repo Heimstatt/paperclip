@@ -1,0 +1,87 @@
+diff --git a/server/src/services/lease-handoff-readmit.test.ts b/server/src/services/lease-handoff-readmit.test.ts
+index 94d68a78..0cc5dfa9 100644
+--- a/server/src/services/lease-handoff-readmit.test.ts
++++ b/server/src/services/lease-handoff-readmit.test.ts
+@@ -1,5 +1,5 @@
+ import { randomUUID } from "node:crypto";
+-import { and, eq } from "drizzle-orm";
++import { and, eq, sql } from "drizzle-orm";
+ import { beforeAll, afterAll, describe, it, expect } from "vitest";
+ import {
+   agentWakeupRequests, agents, companies, createDb, environmentLeases, heartbeatRuns, issueRecoveryActions, issues,
+@@ -108,6 +108,75 @@ const support = await getEmbeddedPostgresTestSupport();
+     expect(await issueRuns(f)).toHaveLength(1);
+   });
+ 
++  it("re-admits a producer handoff in changes_requested on the same stage", async () => {
++    const f = await seed();
++    const receipt = await strand(f);
++    await releaseLease(f);
++    await db.update(issues).set({ status: "in_progress", executionState: {
++      status: "changes_requested", currentStageId: "review-stage",
++      currentParticipant: { type: "agent", agentId: f.otherId },
++      returnAssignee: { type: "agent", agentId: f.ownerId },
++    } }).where(eq(issues.id, f.issueId));
++    await db.update(agentWakeupRequests).set({ payload: {
++      ...receipt.payload, _paperclipWakeContext: {
++        ...receipt.payload._paperclipWakeContext,
++        wakeReason: "execution_changes_requested",
++      }, executionStage: {
++        stageId: "review-stage", wakeRole: "executor",
++        currentParticipant: { type: "agent", agentId: f.otherId },
++        returnAssignee: { type: "agent", agentId: f.ownerId },
++      },
++    } }).where(eq(agentWakeupRequests.id, receipt.id));
++    await heartbeatService(db).readmitLeaseBlockedHandoffs(outgoingRun(f), f.issueId);
++    expect(await issueRuns(f)).toHaveLength(1);
++  });
++
++  it("retries a handoff when admission fails after the receipt is claimed", async () => {
++    const f = await seed();
++    const receipt = await strand(f);
++    await releaseLease(f);
++    await db.execute(sql`create function fail_readmitted_wake() returns trigger language plpgsql as $$
++      begin
++        if new.idempotency_key like 'lease-handoff-readmit:%' then
++          raise exception 'injected readmission failure';
++        end if;
++        return new;
++      end
++    $$`);
++    await db.execute(sql`create trigger fail_readmitted_wake before insert on agent_wakeup_requests
++      for each row execute function fail_readmitted_wake()`);
++    try {
++      await heartbeatService(db).readmitLeaseBlockedHandoffs(outgoingRun(f), f.issueId);
++      expect(await issueRuns(f)).toHaveLength(0);
++    } finally {
++      await db.execute(sql`drop trigger fail_readmitted_wake on agent_wakeup_requests`);
++      await db.execute(sql`drop function fail_readmitted_wake()`);
++    }
++    const [claimed] = await db.select().from(agentWakeupRequests)
++      .where(eq(agentWakeupRequests.id, receipt.id));
++    expect((claimed!.payload as { executionWait?: { readmittedAt?: string } }).executionWait?.readmittedAt).toBeTruthy();
++    await heartbeatService(db).readmitLeaseBlockedHandoffs(outgoingRun(f), f.issueId);
++    expect(await issueRuns(f)).toHaveLength(1);
++  });
++
++  it("recovers a handoff after scheduling suppression ends", async () => {
++    const f = await seed();
++    const receipt = await strand(f);
++    await releaseLease(f);
++    const runtimeEnv = { PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS: "true" };
++    const heartbeat = heartbeatService(db, { runtimeEnv });
++    await heartbeat.readmitLeaseBlockedHandoffs(outgoingRun(f), f.issueId);
++    expect(await issueRuns(f)).toHaveLength(0);
++    const [parked] = await db.select().from(agentWakeupRequests)
++      .where(eq(agentWakeupRequests.id, receipt.id));
++    expect((parked!.payload as { executionWait?: { readmittedAt?: string } }).executionWait?.readmittedAt)
++      .toBeUndefined();
++
++    runtimeEnv.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "false";
++    await heartbeat.resumeQueuedRuns();
++    expect(await issueRuns(f)).toHaveLength(1);
++  }, 30000);
++
+   it("leaves the receipt alone while the lease is still held", async () => {
+     const f = await seed();
+     const receipt = await strand(f);
