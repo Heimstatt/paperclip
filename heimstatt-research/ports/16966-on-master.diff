@@ -1,0 +1,1202 @@
+diff --git a/doc/execution-semantics.md b/doc/execution-semantics.md
+index c59bab4b3f..648d478869 100644
+--- a/doc/execution-semantics.md
++++ b/doc/execution-semantics.md
+@@ -304,7 +304,13 @@ and the user need not certify infrastructure state in a reconciliation form.
+ 
+ Repeated automatic signals for an unchanged gate share one durable skipped-wake diagnostic, scoped to company, agent, issue, gate code, and condition identity. The diagnostic retains the first request and counts later observations. This applies to execution reconciliation, dependencies, pause holds, company and agent availability, budget blocks, and disabled heartbeats. These diagnostics do not consume provider attempts and are never proof that a future wake was delivered. All current gates are checked again on the next wake, including the periodic dependency reconciliation sweep. Clearing one gate does not bypass another.
+ 
+-New comments received during an execution hold retain their individual deferred receipts and ordered comment ids. Release cannot drain those receipts while replay remains blocked; the next eligible wake can adopt them. Authorized external-chat requests also remain deferred with their exact durable receipt. They must use normal promotion and current authorization; a generic wake cannot adopt only their comment ids and discard their actor or session contract. A wait does not authorize replay, reset an incident retry budget, or bypass an interaction's delivery rules.
++A wake whose only gate is the previous execution's unreleased process or environment lease (`execution_owner_active` without a recovery action) is saved input, not a diagnostic: a handoff or stage wake blocked there is the only notification its recipient will get. Admission parks it as a deferred receipt; repeated signals from one requester merge into that receipt. When the executor that held the lease finishes cleanup, the receipt re-enters ordinary admission with its own identity, so every current gate still applies and the receipt is consumed with its successor run. A run of the same agent admitted on that task in the meantime adopts the receipt instead; a receipt whose task closed, changed owner, or moved to another stage participant, or whose agent already started a later run on the task, retires without a run. Chat conversations keep their existing turn rules.
++
++Ownership-wait recovery uses the shared delivery-work coordinator. Admission registers a notification before writing the receipt in its transaction; outer settlement wakes the worker. Startup reconstructs existing receipts, and a bounded retry remains scheduled at the oldest receipt's 30-second retry deadline only while receipts remain pending. Paused companies retain their pending obligation. Empty queues and completed history schedule no scans, and ordinary heartbeat ticks do not inspect this queue. Drain retains admitted notifications without database polling; resume and shutdown use the shared lifecycle. Notifications follow the existing single-active-writer contract: independent SQL/process writers need an explicit wake integration, while startup still reconstructs durable state. This does not establish cross-replica notification delivery or deployed host sleep.
++
++Resume reads the current receipt under the task lock rather than replaying the sweep's snapshot. Admission checks that exact payload and current stage again; a concurrent merged signal stays deferred for the next pass. Adoption uses the same owner/stage eligibility and carries the applicable stage's role, review instructions, and allowed actions into the successor's wake context. Obsolete or conflicting stage instructions are not adopted.
++
++New comments received during an execution hold retain their individual deferred receipts and ordered comment ids. The ownership-wait merge and sweep exclude comments, interrupts, task Retry requests, interaction continuations, and native status receipts before selecting a batch or changing retry timestamps, even when those receipts name the same execution hold. Release cannot drain those receipts while replay remains blocked; the next eligible wake can adopt them. Authorized external-chat requests also remain deferred with their exact durable receipt. They must use normal promotion and current authorization; a generic wake cannot adopt only their comment ids and discard their actor or session contract. A wait does not authorize replay, reset an incident retry budget, or bypass an interaction's delivery rules.
+ 
+ The conversation groups repeated empty pre-start reconciliation cancellations into a neutral waiting notice. Started runs, actual startup failures, and run history remain inspectable. No historical run records are deleted.
+ 
+diff --git a/server/src/__tests__/heartbeat-execution-ownership-wait.test.ts b/server/src/__tests__/heartbeat-execution-ownership-wait.test.ts
+new file mode 100644
+index 0000000000..96065286c2
+--- /dev/null
++++ b/server/src/__tests__/heartbeat-execution-ownership-wait.test.ts
+@@ -0,0 +1,571 @@
++import { randomUUID } from "node:crypto";
++import { and, asc, eq, ne, sql } from "drizzle-orm";
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  agentWakeupRequests, agents, companies, createDb, environmentLeases, heartbeatRuns, issueComments, issues,
++} from "@paperclipai/db";
++import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
++import { getExecutionBlocker } from "../services/execution-blocker.js";
++import { heartbeatService } from "../services/heartbeat.js";
++import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
++import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
++import { registerExecutionControlWork } from "../services/execution-control-work.js";
++import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
++import { idleWorkSnapshot } from "../services/task-admission.js";
++
++const support = await getEmbeddedPostgresTestSupport();
++(support.supported ? describe : describe.skip)("wakes parked behind an execution ownership hold", () => {
++  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
++  let db: ReturnType<typeof createDb>;
++  beforeAll(async () => {
++    database = await startEmbeddedPostgresTestDatabase("execution-ownership-wait-");
++    db = createDb(database.connectionString);
++  }, 90_000);
++  afterAll(async () => { await database?.cleanup(); });
++
++  type Fixture = Awaited<ReturnType<typeof seed>>;
++
++  /**
++   * The production shape of a stage handoff: the outgoing run was cancelled
++   * for the reassignment, its provider stop was acknowledged, and its
++   * environment lease is still held while executor cleanup runs.
++   */
++  async function seed(input: { stage?: boolean } = {}) {
++    const stage = input.stage ?? true;
++    const companyId = randomUUID(), previousAgentId = randomUUID(), nextAgentId = randomUUID();
++    const issueId = randomUUID(), runId = randomUUID(), stageId = randomUUID();
++    await db.insert(companies).values({ id: companyId, name: "Handoff", defaultResponsibleUserId: "board", issuePrefix: "H" + companyId.replaceAll("-", "") });
++    await db.insert(agents).values([
++      { id: previousAgentId, companyId, name: "Author", role: "engineer", adapterType: "opencode_local", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } },
++      { id: nextAgentId, companyId, name: "Reviewer", role: "engineer", adapterType: "opencode_local", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } },
++    ]);
++    const participant = { type: "agent", agentId: nextAgentId, userId: null };
++    const returnAssignee = { type: "agent", agentId: previousAgentId, userId: null };
++    const reviewRequest = { instructions: "Review the change; do not implement it. Report a verdict." };
++    const executionState = {
++      status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
++      currentParticipant: participant, returnAssignee, reviewRequest, completedStageIds: [],
++      lastDecisionId: null, lastDecisionOutcome: null, changesRequestedCount: 0,
++    };
++    await db.insert(issues).values({
++      id: issueId, companyId, title: "Review the change", assigneeAgentId: nextAgentId,
++      ...(stage ? { status: "in_review", executionState } : { status: "in_progress" }),
++    });
++    const finishedAt = new Date(Date.now() - 500);
++    await db.insert(heartbeatRuns).values({
++      id: runId, companyId, agentId: previousAgentId, runtimeMode: "legacy", status: "cancelled",
++      errorCode: "issue_reassigned", error: "Cancelled before issue reassignment",
++      createdAt: new Date(Date.now() - 60_000), startedAt: new Date(Date.now() - 59_000), finishedAt,
++      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
++      resultJson: {
++        conversationContinuation: "continue_conversation_v1", reassignmentStopConfirmed: true,
++        executionCancellation: { state: "acknowledged", acknowledgedAt: finishedAt.toISOString() },
++        cancellation: { reason: "Cancelled before issue reassignment", source: "control_plane", expected: true },
++      },
++    });
++    const [lease] = await db.insert(environmentLeases).values({
++      companyId, issueId, heartbeatRunId: runId, status: "active", provider: "local",
++    }).returning();
++    // Occupy the next agent so admission queues its run without launching a provider.
++    const [busy] = await db.insert(heartbeatRuns).values({ companyId, agentId: nextAgentId, status: "running" }).returning();
++    const executionStage = {
++      stageId, wakeRole: "reviewer", stageType: "review", reviewRequest,
++      allowedActions: ["approve", "request_changes"], returnAssignee, currentParticipant: participant, lastDecisionOutcome: null,
++    };
++    const wake = stage
++      ? {
++          source: "assignment" as const, triggerDetail: "system" as const, reason: "execution_review_requested",
++          payload: { issueId, mutation: "update", executionStage, interruptedRunId: runId },
++          requestedByActorType: "agent" as const, requestedByActorId: previousAgentId,
++          contextSnapshot: { issueId, taskId: issueId, wakeReason: "execution_review_requested", source: "issue.execution_stage", executionStage, interruptedRunId: runId },
++        }
++      : {
++          source: "assignment" as const, triggerDetail: "system" as const, reason: "issue_assigned",
++          payload: { issueId, mutation: "update", interruptedRunId: runId },
++          requestedByActorType: "user" as const, requestedByActorId: "board",
++          contextSnapshot: { issueId, source: "issue.update", interruptedRunId: runId },
++        };
++    return { companyId, previousAgentId, nextAgentId, issueId, runId, stageId, lease: lease!, busy: busy!, wake };
++  }
++
++  const nextAgentWakes = (f: Fixture) => db.select().from(agentWakeupRequests).where(and(
++    eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.agentId, f.nextAgentId),
++  )).orderBy(asc(agentWakeupRequests.requestedAt));
++  const nextAgentIssueRuns = (f: Fixture) => db.select().from(heartbeatRuns).where(and(
++    eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.agentId, f.nextAgentId), ne(heartbeatRuns.id, f.busy.id),
++  )).orderBy(asc(heartbeatRuns.createdAt));
++  const releaseLease = (f: Fixture) => db.update(environmentLeases)
++    .set({ status: "expired", releasedAt: new Date() }).where(eq(environmentLeases.id, f.lease.id));
++
++  async function parkWake(f: Fixture) {
++    const heartbeat = heartbeatService(db);
++    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ runId: f.runId, cause: "execution_owner_active", recoveryActionId: null });
++    expect(await heartbeat.wakeup(f.nextAgentId, f.wake)).toBeNull();
++    const [parked] = await nextAgentWakes(f);
++    expect(parked).toMatchObject({
++      status: "deferred_issue_execution", runId: null, finishedAt: null,
++      payload: { issueId: f.issueId, executionWait: { cause: "execution_owner_active", runId: f.runId, recoveryActionId: null } },
++    });
++    expect(await nextAgentIssueRuns(f)).toHaveLength(0);
++    return { heartbeat, parked: parked! };
++  }
++
++  async function parkComment(f: Fixture) {
++    const [comment] = await db.insert(issueComments).values({
++      companyId: f.companyId, issueId: f.issueId, authorType: "user", authorUserId: "board",
++      body: "Preserve this input during the handoff.",
++    }).returning();
++    const heartbeat = heartbeatService(db);
++    expect(await heartbeat.wakeup(f.nextAgentId, {
++      source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
++      payload: { issueId: f.issueId, commentId: comment!.id },
++      contextSnapshot: { issueId: f.issueId, wakeCommentId: comment!.id },
++      requestedByActorType: "user", requestedByActorId: "board",
++    })).toBeNull();
++    const [parked] = await nextAgentWakes(f);
++    expect(parked).toMatchObject({ status: "deferred_issue_execution", payload: {
++      executionWait: { cause: "execution_owner_active" },
++      _paperclipWakeContext: { wakeReason: "issue_commented", wakeCommentIds: [comment!.id] },
++    } });
++    return { heartbeat, comment: comment!, parked: parked! };
++  }
++
++  it("parks a stage handoff wake behind the outgoing lease and admits it once after the release", async () => {
++    const f = await seed();
++    const { heartbeat, parked } = await parkWake(f);
++
++    // Cleanup has not finished: nothing to admit yet.
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    expect(await nextAgentIssueRuns(f)).toHaveLength(0);
++    expect((await nextAgentWakes(f))[0]!.status).toBe("deferred_issue_execution");
++
++    await releaseLease(f);
++    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
++    await Promise.all([
++      heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId }),
++      heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId }),
++    ]);
++    const runs = await nextAgentIssueRuns(f);
++    expect(runs).toHaveLength(1);
++    expect(runs[0]).toMatchObject({ status: "queued", invocationSource: "assignment", triggerDetail: "system" });
++    expect(runs[0]!.contextSnapshot).toMatchObject({
++      issueId: f.issueId, wakeReason: "execution_review_requested", interruptedRunId: f.runId,
++      executionStage: { stageId: f.stageId, wakeRole: "reviewer", currentParticipant: { agentId: f.nextAgentId } },
++    });
++    const wakes = await nextAgentWakes(f);
++    expect(wakes.find(wake => wake.id === parked.id)).toMatchObject({ status: "coalesced", runId: runs[0]!.id });
++    expect(wakes.find(wake => wake.runId === runs[0]!.id && wake.status === "queued")).toMatchObject({
++      reason: "execution_review_requested", requestedByActorType: "agent", requestedByActorId: f.previousAgentId,
++      idempotencyKey: `execution-wait-resume:${parked.id}`,
++    });
++    expect(wakes.filter(wake => wake.status === "skipped")).toHaveLength(0);
++
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    await heartbeat.resumeQueuedRuns();
++    expect(await nextAgentIssueRuns(f)).toHaveLength(1);
++  });
++
++  it("parks a plain assignment handoff the same way", async () => {
++    const f = await seed({ stage: false });
++    const { heartbeat, parked } = await parkWake(f);
++    await releaseLease(f);
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    const runs = await nextAgentIssueRuns(f);
++    expect(runs).toHaveLength(1);
++    expect(runs[0]!.contextSnapshot).toMatchObject({ issueId: f.issueId, wakeReason: "issue_assigned", interruptedRunId: f.runId });
++    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "coalesced", runId: runs[0]!.id });
++  });
++
++  it("resumes a changes-requested handback to the executor while the reviewer remains the current participant", async () => {
++    const f = await seed();
++    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
++    const currentParticipant = { type: "agent", agentId: f.previousAgentId, userId: null };
++    const returnAssignee = { type: "agent", agentId: f.nextAgentId, userId: null };
++    const executionStage = { ...f.wake.payload.executionStage!, wakeRole: "executor",
++      currentParticipant, returnAssignee, allowedActions: ["address_changes", "resubmit"],
++      lastDecisionOutcome: "changes_requested" };
++    await db.update(issues).set({ status: "todo", executionState: {
++      ...issue!.executionState as Record<string, unknown>, status: "changes_requested",
++      currentParticipant, returnAssignee, lastDecisionOutcome: "changes_requested", changesRequestedCount: 1,
++    } }).where(eq(issues.id, f.issueId));
++    const heartbeat = heartbeatService(db);
++    expect(await heartbeat.wakeup(f.nextAgentId, { ...f.wake, reason: "execution_changes_requested",
++      payload: { ...f.wake.payload, executionStage },
++      contextSnapshot: { ...f.wake.contextSnapshot, wakeReason: "execution_changes_requested", executionStage },
++    })).toBeNull();
++    const [parked] = await nextAgentWakes(f);
++    expect(parked).toMatchObject({ status: "deferred_issue_execution", runId: null });
++    await releaseLease(f);
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    const runs = await nextAgentIssueRuns(f);
++    expect(runs).toHaveLength(1);
++    expect(runs[0]).toMatchObject({ status: "queued", agentId: f.nextAgentId,
++      contextSnapshot: { wakeReason: "execution_changes_requested", executionStage } });
++    const delivered = await buildPaperclipWakePayload({
++      db, companyId: f.companyId, agentId: f.nextAgentId, contextSnapshot: runs[0]!.contextSnapshot!,
++    });
++    expect(delivered?.executionStage).toEqual(executionStage);
++    expect((await nextAgentWakes(f)).find(wake => wake.id === parked!.id))
++      .toMatchObject({ status: "coalesced", runId: runs[0]!.id });
++  });
++
++  it("is picked up by fresh recovery services when the lease is released elsewhere", async () => {
++    const f = await seed();
++    const { parked } = await parkWake(f);
++    await releaseLease(f);
++    // The sweep rotates receipts on a cadence; age this one past it.
++    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, parked.id));
++    // New service instances have only the persisted receipt, as after restart.
++    await Promise.all([heartbeatService(db).resumeExecutionOwnershipWaits(), heartbeatService(db).resumeExecutionOwnershipWaits()]);
++    const runs = await nextAgentIssueRuns(f);
++    expect(runs).toHaveLength(1);
++    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "coalesced", runId: runs[0]!.id });
++  });
++
++  it("merges a repeated signal into the parked receipt", async () => {
++    const f = await seed();
++    const { heartbeat, parked } = await parkWake(f);
++    expect(await heartbeat.wakeup(f.nextAgentId, f.wake)).toBeNull();
++    const wakes = await nextAgentWakes(f);
++    expect(wakes).toHaveLength(1);
++    expect(wakes[0]).toMatchObject({ id: parked.id, status: "deferred_issue_execution", coalescedCount: 1 });
++    await releaseLease(f);
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    expect(await nextAgentIssueRuns(f)).toHaveLength(1);
++  });
++
++  it.each(["eligibility", "admission"] as const)("preserves a newer stage merged before the %s lock", async phase => {
++    const f = await seed();
++    const { heartbeat, parked } = await parkWake(f);
++    await releaseLease(f);
++    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
++    const nextStage = { ...f.wake.payload.executionStage!, stageId: randomUUID(),
++      reviewRequest: { instructions: "Review the revised change instead." } };
++    const transaction = db.transaction.bind(db);
++    let transactions = 0;
++    let merged = false;
++    // Commit the same row update as coalescing, after the sweep has selected
++    // its old snapshot, at each of the two issue-lock boundaries.
++    const spy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
++      if (transactions++ === (phase === "eligibility" ? 0 : 1)) {
++        spy.mockRestore();
++        await transaction(async tx => {
++          await tx.update(issues).set({ executionState: {
++            ...issue!.executionState as Record<string, unknown>, currentStageId: nextStage.stageId,
++            reviewRequest: nextStage.reviewRequest,
++          } }).where(eq(issues.id, f.issueId));
++          await tx.update(agentWakeupRequests).set({ payload: {
++            ...parked.payload, executionStage: nextStage,
++            _paperclipWakeContext: { ...parked.payload!._paperclipWakeContext as Record<string, unknown>, executionStage: nextStage },
++          }, coalescedCount: 1, updatedAt: new Date() }).where(eq(agentWakeupRequests.id, parked.id));
++        });
++        merged = true;
++      }
++      return transaction(callback, config);
++    });
++    try {
++      await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    } finally { spy.mockRestore(); }
++    expect(merged).toBe(true);
++    if (phase === "admission") {
++      expect(await nextAgentIssueRuns(f)).toHaveLength(0);
++      expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)?.status).toBe("deferred_issue_execution");
++      await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    }
++    const runs = await nextAgentIssueRuns(f);
++    expect(runs).toHaveLength(1);
++    expect(runs[0]!.contextSnapshot?.executionStage).toEqual(nextStage);
++    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id))
++      .toMatchObject({ status: "coalesced", runId: runs[0]!.id });
++  });
++
++  it("keeps a handoff separate from the same user's saved comment until ordinary admission adopts both", async () => {
++    const f = await seed({ stage: false });
++    const { heartbeat, comment, parked } = await parkComment(f);
++    await heartbeat.wakeup(f.nextAgentId, f.wake);
++    await heartbeat.wakeup(f.nextAgentId, f.wake);
++    const wakes = await nextAgentWakes(f);
++    expect(wakes).toHaveLength(2);
++    expect(wakes.find(wake => wake.id === parked.id)).toEqual(parked);
++    const handoff = wakes.find(wake => wake.id !== parked.id)!;
++    expect(handoff).toMatchObject({ reason: "issue_assigned", coalescedCount: 1 });
++
++    await releaseLease(f);
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    const runs = await nextAgentIssueRuns(f);
++    expect(runs).toHaveLength(1);
++    expect(runs[0]!.contextSnapshot).toMatchObject({
++      wakeReason: "issue_assigned", wakeCommentIds: [comment.id],
++      queuedCommentSourceWakeIds: expect.arrayContaining([parked.id, handoff.id]),
++    });
++    for (const id of [parked.id, handoff.id]) {
++      expect((await nextAgentWakes(f)).find(wake => wake.id === id))
++        .toMatchObject({ status: "coalesced", runId: runs[0]!.id });
++    }
++    await heartbeat.resumeQueuedRuns();
++    expect(await nextAgentIssueRuns(f)).toHaveLength(1);
++  });
++
++  it("lets the interrupt sweep retry a saved comment after the ownership hold clears", async () => {
++    const f = await seed({ stage: false });
++    const { heartbeat, comment, parked } = await parkComment(f);
++    const requestedAt = new Date(Date.now() - 60_000);
++    await db.update(agentWakeupRequests).set({
++      payload: { ...parked.payload, queuedCommentInterrupt: { actorId: "board", requestedAt: requestedAt.toISOString() } },
++      updatedAt: requestedAt,
++    }).where(eq(agentWakeupRequests.id, parked.id));
++    await releaseLease(f);
++
++    await heartbeat.resumeQueuedRuns();
++    const runs = await nextAgentIssueRuns(f);
++    expect(runs).toHaveLength(1);
++    expect(runs[0]!.contextSnapshot).toMatchObject({ wakeReason: "issue_commented", wakeCommentIds: [comment.id] });
++    const wakes = await nextAgentWakes(f);
++    expect(wakes.find(wake => wake.id === parked.id)).toMatchObject({ status: "coalesced", runId: runs[0]!.id });
++    expect(wakes.find(wake => wake.status === "queued"))
++      .toMatchObject({ idempotencyKey: `queued-comment-interrupt:${parked.id}`, runId: runs[0]!.id });
++    await heartbeat.resumeQueuedRuns();
++    expect(await nextAgentIssueRuns(f)).toHaveLength(1);
++  });
++
++  it("keeps dedicated receipts out of the ownership sweep's batch and retry cadence", async () => {
++    const f = await seed({ stage: false });
++    const older = new Date(Date.now() - 120_000);
++    const dedicatedPayloads = [
++      { commentId: randomUUID() },
++      { _paperclipWakeContext: { wakeCommentId: randomUUID() } },
++      { _paperclipWakeContext: { wakeCommentIds: [randomUUID()] } },
++      { queuedCommentInterrupt: { actorId: "board", requestedAt: older.toISOString() } },
++      { taskRetry: { actorId: "board", generationId: randomUUID(), sourceRunId: f.runId } },
++      { mutation: "interaction", _paperclipWakeContext: { interactionId: randomUUID() } },
++      { _paperclipWakeContext: { continuationPolicy: "wake_assignee" } },
++      { _paperclipWakeContext: { nativeStatusWakeIntentId: randomUUID() } },
++    ];
++    const dedicated = await db.insert(agentWakeupRequests).values(Array.from({ length: 50 }, (_, index) => ({
++      companyId: f.companyId, agentId: f.nextAgentId, source: "automation", reason: "saved_input",
++      status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "board",
++      requestedAt: older, updatedAt: older,
++      payload: { issueId: f.issueId,
++        executionWait: { cause: "execution_owner_active", recoveryActionId: null, runId: f.runId },
++        ...dedicatedPayloads[index % dedicatedPayloads.length],
++      },
++    }))).returning();
++    const heartbeat = heartbeatService(db);
++    await heartbeat.wakeup(f.nextAgentId, f.wake);
++    const wakes = await nextAgentWakes(f);
++    expect(wakes).toHaveLength(51);
++    const handoff = wakes.find(wake => !dedicated.some(other => other.id === wake.id))!;
++    const due = new Date(Date.now() - 60_000);
++    await db.update(agentWakeupRequests).set({ updatedAt: due }).where(eq(agentWakeupRequests.id, handoff.id));
++
++    // Leave the lease held so ordinary admission does not yet adopt comments.
++    await heartbeat.resumeExecutionOwnershipWaits();
++    const after = await nextAgentWakes(f);
++    expect(after.find(wake => wake.id === handoff.id)!.updatedAt.getTime()).toBeGreaterThan(due.getTime());
++    for (const receipt of dedicated) {
++      expect(after.find(wake => wake.id === receipt.id)).toEqual(receipt);
++    }
++  });
++
++  it("is consumed by a later wake of the same agent instead of resuming as a second run", async () => {
++    const f = await seed();
++    const { heartbeat, parked } = await parkWake(f);
++    await releaseLease(f);
++    const later = await heartbeat.wakeup(f.nextAgentId, {
++      source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
++      payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId },
++      requestedByActorType: "user", requestedByActorId: "board",
++    });
++    expect(later).toMatchObject({ status: "queued" });
++    expect(later!.contextSnapshot?.executionStage).toEqual(f.wake.payload.executionStage);
++    const delivered = await buildPaperclipWakePayload({
++      db, companyId: f.companyId, agentId: f.nextAgentId, contextSnapshot: later!.contextSnapshot!,
++    });
++    expect(delivered?.executionStage).toEqual(f.wake.payload.executionStage);
++    expect((await nextAgentWakes(f)).find(wake => wake.id === later!.wakeupRequestId)?.payload?.executionStage)
++      .toEqual(f.wake.payload.executionStage);
++    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "coalesced", runId: later!.id });
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    await heartbeat.resumeQueuedRuns();
++    expect(await nextAgentIssueRuns(f)).toEqual([expect.objectContaining({ id: later!.id })]);
++  });
++
++  it.each(["stage", "participant", "completed"] as const)("does not adopt obsolete stage instructions (%s)", async change => {
++    const f = await seed();
++    const { heartbeat, parked } = await parkWake(f);
++    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
++    await db.update(issues).set({ executionState: {
++      ...issue!.executionState as Record<string, unknown>,
++      ...(change === "stage" ? { currentStageId: randomUUID() }
++        : change === "participant" ? { currentParticipant: { type: "agent", agentId: f.previousAgentId, userId: null } }
++          : { status: "completed", currentStageId: null, currentParticipant: null }),
++    } }).where(eq(issues.id, f.issueId));
++    await releaseLease(f);
++    const later = await heartbeat.wakeup(f.nextAgentId, {
++      source: "on_demand", reason: "issue_commented", payload: { issueId: f.issueId },
++      contextSnapshot: { issueId: f.issueId }, requestedByActorType: "user", requestedByActorId: "board",
++    });
++    expect(later).toMatchObject({ status: "queued" });
++    expect(later!.contextSnapshot?.executionStage).toBeUndefined();
++    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)?.status).toBe("deferred_issue_execution");
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)?.status).toBe("cancelled");
++  });
++
++  it("retires the receipt when a later run of the agent already started on the task", async () => {
++    const f = await seed();
++    const { heartbeat, parked } = await parkWake(f);
++    const [started] = await db.insert(heartbeatRuns).values({
++      companyId: f.companyId, agentId: f.nextAgentId, runtimeMode: "legacy", status: "succeeded",
++      startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented" },
++    }).returning();
++    await releaseLease(f);
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "cancelled", runId: null });
++    expect(await nextAgentIssueRuns(f)).toEqual([expect.objectContaining({ id: started!.id })]);
++  });
++
++  it("waits behind a queued run of the agent that has not started yet", async () => {
++    const f = await seed();
++    const { heartbeat, parked } = await parkWake(f);
++    const [queued] = await db.insert(heartbeatRuns).values({
++      companyId: f.companyId, agentId: f.nextAgentId, runtimeMode: "legacy", status: "queued",
++      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented" },
++    }).returning();
++    await releaseLease(f);
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "deferred_issue_execution" });
++    expect(await nextAgentIssueRuns(f)).toEqual([expect.objectContaining({ id: queued!.id })]);
++  });
++
++  it.each(["participant", "stage", "closed"])("retires a stage receipt the task moved past (%s)", async change => {
++    const f = await seed();
++    const { heartbeat, parked } = await parkWake(f);
++    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
++    const state = issue!.executionState as Record<string, unknown>;
++    await db.update(issues).set(
++      change === "closed" ? { status: "done" }
++        : change === "stage" ? { executionState: { ...state, currentStageId: randomUUID() } }
++          : { executionState: { ...state, currentParticipant: { type: "agent", agentId: f.previousAgentId, userId: null } } },
++    ).where(eq(issues.id, f.issueId));
++    await releaseLease(f);
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "cancelled" });
++    expect(await nextAgentIssueRuns(f)).toHaveLength(0);
++  });
++
++  it("retires an assignment receipt once the task belongs to someone else", async () => {
++    const f = await seed({ stage: false });
++    const { heartbeat, parked } = await parkWake(f);
++    await db.update(issues).set({ assigneeAgentId: f.previousAgentId }).where(eq(issues.id, f.issueId));
++    await releaseLease(f);
++    await heartbeat.resumeExecutionOwnershipWaits({ companyId: f.companyId, issueId: f.issueId });
++    expect((await nextAgentWakes(f)).find(wake => wake.id === parked.id)).toMatchObject({ status: "cancelled" });
++    expect(await nextAgentIssueRuns(f)).toHaveLength(0);
++  });
++
++  describe("shared ownership-wait worker", () => {
++    const coordinators: ReturnType<typeof createDeliveryWorkCoordinator>[] = [];
++    let calls: number;
++    let observed: typeof db;
++    let draining: boolean;
++    const errors: unknown[] = [];
++    beforeEach(async () => {
++      await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
++      calls = 0; draining = false; errors.length = 0;
++      observed = new Proxy(db, { get(target, key) {
++        if (!["select", "update", "insert", "delete", "execute", "transaction"].includes(String(key))) return Reflect.get(target, key);
++        return (...args: unknown[]) => { calls++; return Reflect.apply(Reflect.get(target, key), target, args); };
++      } });
++      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"], shouldAdvanceTime: true });
++    });
++    afterEach(async () => {
++      for (const c of coordinators.splice(0)) await c.stop();
++      vi.useRealTimers();
++    });
++    async function start() {
++      const heartbeat = heartbeatService(observed);
++      const c = createDeliveryWorkCoordinator({ owner: db, canRun: () => !draining,
++        canReconcile: () => true, onError: error => { errors.push(error); } });
++      coordinators.push(c);
++      await registerExecutionControlWork(c, [{ queue: DELIVERY_QUEUES.executionOwnershipWaits,
++        run: heartbeat.resumeExecutionOwnershipWaits, next: heartbeat.nextExecutionOwnershipWaitAt }]).ready;
++      return c;
++    }
++    async function settle() {
++      await vi.advanceTimersByTimeAsync(30_000);
++      await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(0), { timeout: 5000 });
++      expect(errors).toEqual([]);
++    }
++    async function quiet(c: Awaited<ReturnType<typeof start>>) {
++      await settle();
++      expect(c.nextWakeAt()).toBeNull();
++      const before = calls;
++      await vi.advanceTimersByTimeAsync(90_000);
++      expect(calls).toBe(before);
++    }
++    it("does no recurring database work when empty or settled, and the first real producer wakes it", async () => {
++      const c = await start();
++      await quiet(c);
++      const f = await seed();
++      await parkWake(f);
++      await settle();
++      expect(c.nextWakeAt()).not.toBeNull();
++      expect(await nextAgentIssueRuns(f)).toHaveLength(0);
++      await releaseLease(f);
++      await settle();
++      expect(await nextAgentIssueRuns(f)).toHaveLength(1);
++      await quiet(c);
++      const restarted = await start();
++      await quiet(restarted);
++    });
++    it("reconstructs pending receipts at startup and two workers admit only one successor", async () => {
++      const f = await seed();
++      const { parked } = await parkWake(f);
++      await releaseLease(f);
++      await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) })
++        .where(eq(agentWakeupRequests.id, parked.id));
++      const workers = await Promise.all([start(), start()]);
++      expect(await nextAgentIssueRuns(f)).toHaveLength(1);
++      for (const c of workers) await quiet(c);
++    });
++    it.each([false, true])("observes nested admission only after outer settlement (rollback=%s)", async rollback => {
++      const c = await start();
++      await quiet(c);
++      const f = await seed();
++      const before = calls;
++      const write = db.transaction(async tx => {
++        expect(await heartbeatService(tx as unknown as typeof db).wakeup(f.nextAgentId, f.wake)).toBeNull();
++        await vi.advanceTimersByTimeAsync(1);
++        expect(calls).toBe(before);
++        if (rollback) throw new Error("rollback admission");
++      });
++      if (rollback) await expect(write).rejects.toThrow("rollback admission");
++      else await write;
++      await releaseLease(f);
++      await settle();
++      expect(await nextAgentIssueRuns(f)).toHaveLength(rollback ? 0 : 1);
++      await quiet(c);
++    });
++    it("retains a committed wake during drain without database polling, then resumes once", async () => {
++      const c = await start();
++      await quiet(c);
++      const f = await seed();
++      draining = true;
++      await parkWake(f);
++      await releaseLease(f);
++      const before = calls;
++      await vi.advanceTimersByTimeAsync(60_000);
++      expect(calls).toBe(before);
++      draining = false;
++      await settle();
++      expect(await nextAgentIssueRuns(f)).toHaveLength(1);
++      await quiet(c);
++      await c.stop();
++      const stoppedCalls = calls;
++      await parkWake(await seed());
++      await vi.advanceTimersByTimeAsync(60_000);
++      expect(calls).toBe(stoppedCalls);
++    });
++  });
++});
+diff --git a/server/src/__tests__/heartbeat-process-recovery.test.ts b/server/src/__tests__/heartbeat-process-recovery.test.ts
+index fb8b3584d9..0ec44bfb1a 100644
+--- a/server/src/__tests__/heartbeat-process-recovery.test.ts
++++ b/server/src/__tests__/heartbeat-process-recovery.test.ts
+@@ -1909,6 +1909,68 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
+     },
+   );
+ 
++  it("re-admits a handoff wake parked behind the stopped run's lease once executor cleanup releases it", async () => {
++    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
++    const [reviewer] = await db.insert(agents).values({ companyId, name: "Reviewer", role: "engineer", adapterType: "codex_local",
++      status: "idle", adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {} }).returning();
++    // Occupy the reviewer so admission queues its run without launching a provider.
++    const [busy] = await db.insert(heartbeatRuns).values({ companyId, agentId: reviewer!.id, status: "running", contextSnapshot: {} }).returning();
++    const identity = { id: randomUUID(), companyId, issueId, heartbeatRunId: runId, provider: "local" };
++    let openRelease!: () => void;
++    const releaseGate = new Promise<void>(resolve => { openRelease = resolve; });
++    const originalFactory = environmentOrchestrator.environmentRunOrchestrator;
++    const release = vi.fn(async () => {
++      await releaseGate;
++      // The executor's own local lease and the fixture lease release together.
++      await db.update(environmentLeases).set({ status: "expired", releasedAt: new Date() })
++        .where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId)));
++      return { released: [], errors: [] };
++    });
++    const factory = vi.spyOn(environmentOrchestrator, "environmentRunOrchestrator").mockImplementation((...args) => ({
++      ...originalFactory(...args), releaseForRun: release,
++    }));
++    const heartbeat = heartbeatService(db);
++    let cancellation: ReturnType<typeof heartbeat.cancelRun> | undefined;
++    mockAdapterExecute.mockImplementationOnce(async (input?: unknown) => {
++      const invocation = input as { onCancellationReady: () => Promise<void>; onDispatch: () => void };
++      await invocation.onCancellationReady();
++      invocation.onDispatch();
++      await db.insert(environmentLeases).values({ ...identity, status: "active", leasePolicy: "ephemeral" });
++      // The handoff stops the author's run; its lease stays held until cleanup.
++      cancellation = heartbeat.cancelRun(runId, "Cancelled before issue reassignment",
++        { errorCode: "issue_reassigned", resultJson: { reassignmentStopConfirmed: true } });
++      void cancellation.catch(() => undefined);
++      await waitForValue(async () => adapterExecutionControls.get(runId)?.controller.signal.aborted);
++      return { exitCode: 1, signal: "SIGTERM", timedOut: false, errorMessage: "Stopped", errorCode: "cancelled",
++        resultJson: { executionCancellation: { state: "acknowledged" } }, summary: "Stopped turn", provider: "test", model: "test-model" };
++    });
++    try {
++      await heartbeat.resumeQueuedRuns();
++      // The run is terminal and its lock released while its executor still waits on the lease release.
++      await waitForValue(async () => release.mock.calls.length > 0 || null);
++      await waitForValue(async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status === "cancelled" || null);
++      await waitForValue(async () => (await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.executionRunId === null || null);
++      await db.update(issues).set({ assigneeAgentId: reviewer!.id }).where(eq(issues.id, issueId));
++      expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ runId, cause: "execution_owner_active" });
++      expect(await heartbeat.wakeup(reviewer!.id, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
++        payload: { issueId, mutation: "update", interruptedRunId: runId }, requestedByActorType: "agent", requestedByActorId: agentId,
++        contextSnapshot: { issueId, source: "issue.update", interruptedRunId: runId } })).toBeNull();
++      const [parked] = await db.select().from(agentWakeupRequests).where(and(
++        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, reviewer!.id)));
++      expect(parked).toMatchObject({ status: "deferred_issue_execution", payload: { executionWait: { cause: "execution_owner_active", runId } } });
++      openRelease();
++      await heartbeat.drainActiveRunExecutions();
++      expect((await cancellation)?.status).toBe("cancelled");
++      const reviewerRuns = (await db.select().from(heartbeatRuns).where(and(
++        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, reviewer!.id)))).filter(run => run.id !== busy!.id);
++      expect(reviewerRuns).toHaveLength(1);
++      expect(reviewerRuns[0]).toMatchObject({ status: "queued",
++        contextSnapshot: expect.objectContaining({ issueId, wakeReason: "issue_assigned", interruptedRunId: runId }) });
++      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, parked!.id)))[0])
++        .toMatchObject({ status: "coalesced", runId: reviewerRuns[0]!.id });
++    } finally { factory.mockRestore(); }
++  });
++
+   it("does not reuse a completed explicit turn's receipt for a missing-comment follow-up", async () => {
+     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+     const sourceRunId = randomUUID(), commentId = randomUUID();
+diff --git a/server/src/__tests__/server-startup-feedback-export.test.ts b/server/src/__tests__/server-startup-feedback-export.test.ts
+index 420a18bbc8..419957caad 100644
+--- a/server/src/__tests__/server-startup-feedback-export.test.ts
++++ b/server/src/__tests__/server-startup-feedback-export.test.ts
+@@ -139,6 +139,8 @@ const {
+     registerCapturedInstructionCommitWork: vi.fn((_coordinator: unknown, _canRun: () => boolean) => ({ ready: Promise.resolve() })),
+     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
+     resumeQueuedRuns: vi.fn(async () => undefined),
++    resumeExecutionOwnershipWaits: vi.fn(async () => undefined),
++    nextExecutionOwnershipWaitAt: vi.fn(async () => null),
+     recoverPendingSessionGoalActions: vi.fn(async () => ({ scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0 })),
+     recoverActiveSessionGoals: vi.fn(async () => ({ scanned: 0, enqueued: 0 })),
+     reconcileStrandedAssignedIssues: vi.fn(async () => ({
+diff --git a/server/src/index.ts b/server/src/index.ts
+index 424580c2a6..ca0f392033 100644
+--- a/server/src/index.ts
++++ b/server/src/index.ts
+@@ -1374,6 +1374,7 @@ async function startServerWithDatabaseTeardown(
+     { queue: DELIVERY_QUEUES.executionStatus, run: () => deliverExecutionStatuses(db), next: executionSchedule.status },
+     { queue: DELIVERY_QUEUES.executionDisposition, run: () => settleUnrecoverableExecutions(db), next: executionSchedule.disposition },
+     ...(heartbeat ? [
++      { queue: DELIVERY_QUEUES.executionOwnershipWaits, run: () => heartbeat.resumeExecutionOwnershipWaits(), next: heartbeat.nextExecutionOwnershipWaitAt },
+       { queue: DELIVERY_QUEUES.executionReplacement, run: () => reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run) }), next: executionSchedule.replacement },
+       { queue: DELIVERY_QUEUES.executionContinuation, run: () => deliverReconciledExecutions(db, heartbeat.wakeup), next: executionSchedule.continuation },
+     ] : []),
+diff --git a/server/src/services/delivery-work-notifications.ts b/server/src/services/delivery-work-notifications.ts
+index 67cfa6173d..891631431e 100644
+--- a/server/src/services/delivery-work-notifications.ts
++++ b/server/src/services/delivery-work-notifications.ts
+@@ -50,6 +50,7 @@ export const DELIVERY_QUEUES = {
+   secretProposalExpiry: "secret-proposal-expiry",
+   customImageExpiry: "custom-image-expiry",
+   historicalCleanup: "historical-cleanup",
++  executionOwnershipWaits: "execution-ownership-waits",
+   adapterLoginCleanup: "adapter-login-cleanup",
+   setupTokenCleanup: "setup-token-cleanup",
+   localLoginCleanup: "local-login-cleanup",
+diff --git a/server/src/services/heartbeat.ts b/server/src/services/heartbeat.ts
+index de0f082c8e..203ca1beb4 100644
+--- a/server/src/services/heartbeat.ts
++++ b/server/src/services/heartbeat.ts
+@@ -1478,6 +1478,10 @@ export function heartbeatService(
+     return runControl.resumeExecutionWaitComments(...args);
+   }
+ 
++  function resumeExecutionOwnershipWaits(...args: Parameters<typeof runControl.resumeExecutionOwnershipWaits>) {
++    return runControl.resumeExecutionOwnershipWaits(...args);
++  }
++
+   function resumeQueuedCommentInterrupt(...args: Parameters<typeof runControl.resumeQueuedCommentInterrupt>) {
+     return runControl.resumeQueuedCommentInterrupt(...args);
+   }
+@@ -3972,6 +3976,16 @@ export function heartbeatService(
+         if (latestRun) await resumeRemoteStopComments(latestRun).catch(err => {
+           logger.warn({ err, runId: run.id }, "failed to resume user messages after remote Stop");
+         });
++        // The lease this executor held was the only gate for a handoff wake
++        // parked behind it. Its release is observed nowhere else.
++        const ownershipWaitIssueId = latestRun && isHeartbeatRunTerminalStatus(latestRun.status)
++          ? readNonEmptyString(latestRun.contextSnapshot?.issueId) ?? latestRun.nativeIssueId
++          : null;
++        if (ownershipWaitIssueId) {
++          await resumeExecutionOwnershipWaits({ companyId: run.companyId, issueId: ownershipWaitIssueId }).catch(err => {
++            logger.warn({ err, runId: run.id }, "failed to resume wakes parked behind the released execution hold");
++          });
++        }
+         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+           await toolActionDeliveryService(db, { wakeup: trackWakeup })
+             .deliverForRun({ companyId: run.companyId, runId: run.id })
+@@ -4260,6 +4274,8 @@ export function heartbeatService(
+     resumeTaskRetry: runControl.resumeTaskRetry,
+     resumeQueuedCommentInterrupt,
+     resumeExecutionWaitComments,
++    resumeExecutionOwnershipWaits,
++    nextExecutionOwnershipWaitAt: runControl.nextExecutionOwnershipWaitAt,
+ 
+     sweepStaleIssueLocks,
+ 
+diff --git a/server/src/services/heartbeat/queue.ts b/server/src/services/heartbeat/queue.ts
+index a41b486b64..538d7b55db 100644
+--- a/server/src/services/heartbeat/queue.ts
++++ b/server/src/services/heartbeat/queue.ts
+@@ -20,6 +20,7 @@ import {
+   mergeCoalescedContextSnapshot,
+   enrichWakeContextSnapshot,
+   hasInteractionContinuationWakeContext,
++  INTERACTION_CONTINUATION_CONTEXT_KEYS,
+   isInteractionResolutionWakePayload,
+ } from "./run-preparation.js";
+ import { resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
+@@ -69,6 +70,8 @@ import {
+ import { agentService } from "../agents.js";
+ import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
+ import { randomUUID } from "node:crypto";
++import { isDeepStrictEqual } from "node:util";
++import { parseIssueExecutionState } from "../issue-execution-policy.js";
+ import {
+   and,
+   asc,
+@@ -235,6 +238,71 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
+ 
+ export const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+ 
++/** Blocker cause of a transient hold: the previous execution still owns its process or environment lease. */
++export const EXECUTION_OWNER_ACTIVE_CAUSE = "execution_owner_active";
++
++/**
++ * A wake parked only because the previous execution had not yet released its
++ * process or environment lease. The receipt is saved input, not a diagnostic:
++ * cleanup of that execution and the periodic sweep return it to admission.
++ * Saved comments, interaction deliveries, and native status wakes keep their
++ * own receipts and resume paths even when the same hold parked them.
++ */
++export function isDeferredExecutionOwnershipWait(payload: unknown): boolean {
++  const parsed = parseObject(payload);
++  const wait = parseObject(parsed.executionWait);
++  const context = parseObject(parsed[DEFERRED_WAKE_CONTEXT_KEY]);
++  return wait.cause === EXECUTION_OWNER_ACTIVE_CAUSE && !wait.recoveryActionId &&
++    !parsed.queuedCommentInterrupt && !parsed.taskRetry &&
++    queuedCommentIdsFromWakePayload(parsed).length === 0 &&
++    !readNonEmptyString(parsed.commentId) && !readNonEmptyString(context.wakeCommentId) &&
++    !isInteractionResolutionWakePayload(parsed) &&
++    !hasInteractionContinuationWakeContext(context) &&
++    !readNonEmptyString(context.nativeStatusWakeIntentId);
++}
++
++/** Eligibility is shared by resume and adoption, under the task's row lock. */
++export function executionOwnershipWaitAppliesToIssue(
++  payload: unknown,
++  issue: Pick<typeof issues.$inferSelect, "status" | "assigneeAgentId" | "executionState">,
++  agentId: string,
++): boolean {
++  if (["done", "cancelled"].includes(issue.status)) return false;
++  const stage = parseObject(parseObject(payload).executionStage);
++  const stageId = readNonEmptyString(stage.stageId);
++  if (!stageId) return issue.assigneeAgentId === agentId;
++  const state = parseIssueExecutionState(issue.executionState);
++  const executorWake = stage.wakeRole === "executor";
++  const principal = executorWake ? state?.returnAssignee : state?.currentParticipant;
++  const stageApplies = executorWake
++    ? state?.status === "changes_requested"
++    : state?.status === "pending" && state.currentStageId === stageId;
++  return stageApplies && principal?.type === "agent" && principal.agentId === agentId;
++}
++
++/**
++ * Select ownership receipts before applying a batch limit or changing retry
++ * timestamps. Other saved input may carry the same blocker cause, but belongs
++ * to a dedicated resume path. Keep the payload check above at mutation sites.
++ */
++export function deferredExecutionOwnershipWaitPredicate() {
++  const payload = agentWakeupRequests.payload;
++  const context = sql`${payload}->${DEFERRED_WAKE_CONTEXT_KEY}`;
++  return and(
++    eq(agentWakeupRequests.status, "deferred_issue_execution"),
++    sql`${payload}->'executionWait'->>'cause' = ${EXECUTION_OWNER_ACTIVE_CAUSE}`,
++    sql`${payload}->'executionWait'->>'recoveryActionId' is null`,
++    sql`${payload}->>'queuedCommentInterrupt' is null`,
++    sql`${payload}->>'taskRetry' is null`,
++    sql`nullif(btrim(${payload}->>'commentId'), '') is null`,
++    sql`coalesce(nullif(${context}->'wakeCommentIds', 'null'::jsonb), '[]'::jsonb) = '[]'::jsonb`,
++    sql`btrim(${payload}->>'mutation') is distinct from 'interaction'`,
++    ...["wakeCommentId", "nativeStatusWakeIntentId", ...INTERACTION_CONTINUATION_CONTEXT_KEYS].map(
++      (key) => sql`nullif(btrim(${context}->>${key}), '') is null`,
++    ),
++  );
++}
++
+ export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
+   "queued",
+   "running",
+@@ -2238,6 +2306,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+       }
+       payload = { ...payload, manualUserWake: true };
+     }
++    if (opts.executionWaitResumeId && (!opts.executionWaitResumePayload || opts.executionWaitResumeId !== executionWaitRequestId ||
++        opts.queuedCommentInterruptId || opts.queuedCommentRequestId || opts.taskRetryRequestId || opts.manualUserWake || opts.failedRunId ||
++        opts.durableChatRequest || opts.durableDotRequest || opts.durableMuseRequest || opts.durableCaseHandoffRequest)) {
++      throw conflict("An execution wait resume cannot carry another admission authority.");
++    }
+     const executionReconciliationWake =
+       contextSnapshot.source === "execution.reconciled" ||
+       opts.idempotencyKey?.startsWith("execution-reconciliation:") === true;
+@@ -2910,25 +2983,40 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+           );
+ 
+           if (executionWaitRequestId) {
++            // A parked ownership wait replays its own receipt's actor, which
++            // may be an agent or the system; it carries no comment to validate.
++            const ownershipWaitResume = opts.executionWaitResumeId === executionWaitRequestId;
+             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
+               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
+               eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+               // A user message can join a queue originally created by a
+               // system wake. Admission validates the saved user comment or board click.
+-              (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
+-                ? undefined : eq(agentWakeupRequests.requestedByActorType,
+-                    durableRequest ? opts.requestedByActorType ?? "" : "user"),
++              ownershipWaitResume
++                ? and(
++                    sql`${agentWakeupRequests.payload}->'executionWait'->>'cause' = ${EXECUTION_OWNER_ACTIVE_CAUSE}`,
++                    sql`${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId' is null`,
++                    sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
++                    opts.requestedByActorType
++                      ? eq(agentWakeupRequests.requestedByActorType, opts.requestedByActorType)
++                      : isNull(agentWakeupRequests.requestedByActorType),
++                  )
++                : (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
++                  ? undefined : eq(agentWakeupRequests.requestedByActorType,
++                      durableRequest ? opts.requestedByActorType ?? "" : "user"),
+               opts.queuedCommentInterruptId === executionWaitRequestId
+                 ? sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${opts.requestedByActorId ?? ""}`
+                 : opts.queuedCommentRequestId === executionWaitRequestId ? undefined
+-                  : eq(agentWakeupRequests.requestedByActorId, opts.requestedByActorId ?? ""),
++                  : ownershipWaitResume && !opts.requestedByActorId ? isNull(agentWakeupRequests.requestedByActorId)
++                    : eq(agentWakeupRequests.requestedByActorId, opts.requestedByActorId ?? ""),
+               sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+             ));
+             // The issue lock serializes cleanup callbacks and periodic workers.
+             // An adopted, discarded, or edited receipt is no longer authority.
+-            if (!pending || (!opts.taskRetryRequestId && !(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
+-                !(opts.queuedCommentInterruptId && await readQueuedInteractionResponse(tx as unknown as Db,
+-                  agent.companyId, issueId, pending.payload)))) {
++            if (!pending || (ownershipWaitResume
++                ? !isDeferredExecutionOwnershipWait(pending.payload) || !isDeepStrictEqual(pending.payload, opts.executionWaitResumePayload)
++                : !opts.taskRetryRequestId && !(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
++                  !(opts.queuedCommentInterruptId && await readQueuedInteractionResponse(tx as unknown as Db,
++                    agent.companyId, issueId, pending.payload)))) {
+               return { kind: "deferred" as const };
+             }
+             if (opts.taskRetryRequestId && durableRequest?.failedRunRetry) {
+@@ -3172,6 +3260,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+               monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+               executionRunId: issues.executionRunId,
+               executionAgentNameKey: issues.executionAgentNameKey,
++              executionState: issues.executionState,
+               createdAt: issues.createdAt,
+             })
+             .from(issues)
+@@ -3183,6 +3272,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+             )
+             .then((rows) => rows[0] ?? null);
+ 
++          if (issue && opts.executionWaitResumeId &&
++              !executionOwnershipWaitAppliesToIssue(opts.executionWaitResumePayload, issue, agentId)) {
++            return { kind: "deferred" as const };
++          }
+           if (!issue) {
+             if (caseRequest) throw conflict("Case handoff task no longer exists");
+             await tx.insert(agentWakeupRequests).values({
+@@ -3396,11 +3489,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+           let continuationWait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+           let continuationBlocked = false;
+           const deferBlockedExecution = async (
+-            executionBlocker: Pick<NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>, "recoveryActionId" | "cause" | "nextAction">,
++            executionBlocker: Pick<NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>, "recoveryActionId" | "cause" | "nextAction"> &
++              Partial<Pick<NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>, "runId">>,
+           ) => {
+             if (caseRequest) waitForCaseAdmission("execution_reconciliation_required", executionBlocker.nextAction);
+             opts.issueStateGuard?.onExecutionDeferred?.(executionBlocker.cause);
+-            const condition = { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait };
++            // The previous execution's process or lease is the only gate. That
++            // hold ends in its cleanup, which nothing else re-reads, so the wake
++            // is saved input for cleanup and the periodic sweep, not a diagnostic.
++            const ownershipHold = executionBlocker.cause === EXECUTION_OWNER_ACTIVE_CAUSE &&
++              !executionBlocker.recoveryActionId && !isConversation(issue);
++            const condition = {
++              recoveryActionId: executionBlocker.recoveryActionId,
++              ...(ownershipHold ? { cause: executionBlocker.cause, runId: executionBlocker.runId } : {}),
++              ...continuationWait,
++            };
+             if (executionWaitRequestId) {
+               await tx.update(agentWakeupRequests).set({
+                 payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}', ${JSON.stringify(condition)}::jsonb)`,
+@@ -3428,6 +3531,53 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+                 requestedByActorId: opts.requestedByActorId ?? null,
+                 idempotencyKey: opts.idempotencyKey ?? null,
+               });
++            } else if (ownershipHold) {
++              // Register before the durable write; only outer settlement wakes
++              // the shared worker. A restart reconstructs the same receipts.
++              await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionOwnershipWaits, issue.id);
++              const parkedPayload = {
++                ...payload,
++                issueId: issue.id,
++                [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
++                executionWait: condition,
++              };
++              // Repeated signals from one requester share one parked receipt;
++              // the newest context wins, as it does for an active execution.
++              const [parked] = await tx.select().from(agentWakeupRequests).where(and(
++                eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.agentId, agentId),
++                sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
++                deferredExecutionOwnershipWaitPredicate(),
++                opts.requestedByActorType
++                  ? eq(agentWakeupRequests.requestedByActorType, opts.requestedByActorType)
++                  : isNull(agentWakeupRequests.requestedByActorType),
++                opts.requestedByActorId
++                  ? eq(agentWakeupRequests.requestedByActorId, opts.requestedByActorId)
++                  : isNull(agentWakeupRequests.requestedByActorId),
++              )).orderBy(asc(agentWakeupRequests.requestedAt)).limit(1);
++              if (parked && isDeferredExecutionOwnershipWait(parked.payload)) {
++                const parkedContext = parseObject(parseObject(parked.payload)[DEFERRED_WAKE_CONTEXT_KEY]);
++                await tx.update(agentWakeupRequests).set({
++                  payload: {
++                    ...parseObject(parked.payload),
++                    ...parkedPayload,
++                    [DEFERRED_WAKE_CONTEXT_KEY]: mergeCoalescedContextSnapshot(parkedContext, enrichedContextSnapshot, {
++                      preserveExistingInteractionContinuation: true,
++                    }),
++                  },
++                  coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
++                  updatedAt: new Date(),
++                }).where(eq(agentWakeupRequests.id, parked.id));
++              } else {
++                await tx.insert(agentWakeupRequests).values({
++                  ...durableReceiptFields,
++                  companyId: agent.companyId, agentId, source, triggerDetail, reason,
++                  payload: parkedPayload,
++                  status: "deferred_issue_execution",
++                  requestedByActorType: opts.requestedByActorType ?? null,
++                  requestedByActorId: opts.requestedByActorId ?? null,
++                  idempotencyKey: opts.idempotencyKey ?? null,
++                });
++              }
+             } else {
+               await recordExecutionWait(tx as unknown as Db, {
+                 issueId: issue.id, condition, coalesce: coalesceExecutionWait,
+@@ -4377,6 +4527,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
+             const deferredContext = parseObject(
+               deferredPayload[DEFERRED_WAKE_CONTEXT_KEY],
+             );
++            if (wake.agentId === agentId && isDeferredExecutionOwnershipWait(deferredPayload)) {
++              if (!executionOwnershipWaitAppliesToIssue(deferredPayload, issue, agentId)) return false;
++              const stage = parseObject(deferredPayload.executionStage);
++              if (readNonEmptyString(stage.stageId)) {
++                // Deliver the stage contract with the adopting run. An incoming
++                // stage contract takes precedence over a different saved one.
++                const incoming = parseObject(enrichedContextSnapshot.executionStage);
++                if (Object.keys(incoming).length && !isDeepStrictEqual(incoming, stage)) return false;
++                enrichedContextSnapshot.executionStage = stage;
++                payload = { ...payload, executionStage: stage,
++                  [DEFERRED_WAKE_CONTEXT_KEY]: { ...parseObject(payload?.[DEFERRED_WAKE_CONTEXT_KEY]), executionStage: stage } };
++              }
++              return true;
++            }
+             // Dedicated interaction wakes carry their own source and session
+             // contract. ID-only adoption must not erase that continuation.
+             return (
+diff --git a/server/src/services/heartbeat/run-control.ts b/server/src/services/heartbeat/run-control.ts
+index 820f1e50c6..70d697ed46 100644
+--- a/server/src/services/heartbeat/run-control.ts
++++ b/server/src/services/heartbeat/run-control.ts
+@@ -7,9 +7,14 @@ import { readNativeStopExecutionEvidence } from "./native-stop-evidence-read.js"
+ import { readTaskRetryIntent, reconcileTaskChatRetryReceipts } from "../task-retry.js";
+ import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProcessStop, recordedLocalExecutionStopped } from "../native-local-process-stop.js";
+ import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
++import {
++  DEFERRED_WAKE_CONTEXT_KEY,
++  deferredExecutionOwnershipWaitPredicate,
++  executionOwnershipWaitAppliesToIssue,
++  isDeferredExecutionOwnershipWait,
++} from "./queue.js";
+ import { pendingCaseHandoffForRun, cancelCaseHandoffsForIssue, isCaseHandoffSourceReleased } from "./case-handoff-lifecycle.js";
+ import { publishActivity, type ActivityPublication } from "../activity-log.js";
+-import { DEFERRED_WAKE_CONTEXT_KEY } from "./queue.js";
+ import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./recovery.js";
+ import {
+   type WakeupOptions,
+@@ -841,6 +846,130 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
+     }
+   }
+ 
++  /**
++   * Returns a wake parked behind an execution ownership hold to ordinary
++   * admission once that hold is gone. The finishing run's own release never
++   * drains an acknowledged Stop, and the stranded-queue sweeps select saved
++   * comments, so the handoff such a wake carried would otherwise wait for a
++   * manual wake. Admission applies every current gate again and adopts the
++   * receipt with its successor; a receipt the task has moved past retires here.
++   */
++  async function resumeExecutionOwnershipWait(snapshot: typeof agentWakeupRequests.$inferSelect) {
++    const issueId = readNonEmptyString(parseObject(snapshot.payload).issueId);
++    if (!issueId || !isUuidLike(issueId)) return;
++    const now = new Date();
++    const wake = await db.transaction(async (tx) => {
++      const [issue] = await tx.select().from(issues).where(and(
++        eq(issues.companyId, snapshot.companyId), eq(issues.id, issueId),
++      )).for("update");
++      const [current] = await tx.select().from(agentWakeupRequests).where(and(
++        eq(agentWakeupRequests.id, snapshot.id), eq(agentWakeupRequests.companyId, snapshot.companyId),
++        eq(agentWakeupRequests.status, "deferred_issue_execution"),
++      ));
++      if (!current || !isDeferredExecutionOwnershipWait(current.payload) ||
++          readNonEmptyString(parseObject(current.payload).issueId) !== issueId) return null;
++      const retire = async (reason: string) => {
++        await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, error: reason, updatedAt: now })
++          .where(and(eq(agentWakeupRequests.id, current.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
++        return null;
++      };
++      if (!issue || ["done", "cancelled"].includes(issue.status)) {
++        return retire("Deferred execution wake no longer applies to a terminal task");
++      }
++      if (!executionOwnershipWaitAppliesToIssue(current.payload, issue, current.agentId)) {
++        return retire("Deferred execution wake no longer applies to the task owner or stage");
++      }
++      // A later run of this agent on the task read the state this wake
++      // announced. One that has not started yet may still be refused at
++      // dispatch, so wait for it instead of retiring the receipt against it.
++      const laterRuns = await tx.select({ startedAt: heartbeatRuns.startedAt, status: heartbeatRuns.status })
++        .from(heartbeatRuns).where(and(
++          eq(heartbeatRuns.companyId, current.companyId), eq(heartbeatRuns.agentId, current.agentId),
++          or(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, eq(heartbeatRuns.nativeIssueId, issueId)),
++          gt(heartbeatRuns.createdAt, current.requestedAt),
++        ));
++      if (laterRuns.some(run => run.startedAt)) return retire("A later run of this agent superseded the deferred execution wake");
++      if (laterRuns.some(run => ["queued", "scheduled_retry"].includes(run.status))) return null;
++      if (!["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return null;
++      // Any remaining hold, including a recovery action recorded since, keeps
++      // the receipt for a later sweep without changing what it waits on.
++      if (await getExecutionBlocker(tx as unknown as Db, current.companyId, issueId)) {
++        await tx.update(agentWakeupRequests).set({ updatedAt: now }).where(eq(agentWakeupRequests.id, current.id));
++        return null;
++      }
++      return current;
++    });
++    if (!wake) return;
++    const payload = parseObject(wake.payload);
++    const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
++    const resumePayload = { ...payload };
++    delete resumePayload.executionWait;
++    delete resumePayload[DEFERRED_WAKE_CONTEXT_KEY];
++    // Re-enter ordinary admission with the receipt's own identity. Under the
++    // issue lock it revalidates the receipt and consumes it with its successor.
++    const run = await enqueueWakeup(wake.agentId, {
++      source: wake.source as WakeupOptions["source"],
++      triggerDetail: (wake.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
++      reason: readNonEmptyString(context.wakeReason) ?? wake.reason,
++      payload: resumePayload, contextSnapshot: context,
++      requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
++      requestedByActorId: wake.requestedByActorId,
++      idempotencyKey: `execution-wait-resume:${wake.id}`,
++      executionWaitResumeId: wake.id,
++      executionWaitResumePayload: payload,
++    }, wake.id);
++    if (!run) return;
++    // A wake merged into an active run of this agent leaves the receipt
++    // deferred. That run covers it; retire the receipt against the run.
++    await db.update(agentWakeupRequests).set({ status: "coalesced", runId: run.id, finishedAt: new Date(), updatedAt: new Date() })
++      .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
++        eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.payload, payload)));
++  }
++
++  /**
++   * Executor cleanup calls this for the task whose lease it released; the
++   * shared worker covers holds released elsewhere, such as lease expiry or
++   * a restart. It is scheduled only while durable receipts remain.
++   */
++  async function resumeExecutionOwnershipWaits(scope?: { companyId: string; issueId: string }) {
++    if ((await getSchedulingSuppression()).suppressed) return;
++    const cadence = new Date(Date.now() - 30_000);
++    const parked = await db.select({ wake: agentWakeupRequests }).from(agentWakeupRequests)
++      .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
++      .where(and(
++        deferredExecutionOwnershipWaitPredicate(),
++        scope
++          ? and(eq(agentWakeupRequests.companyId, scope.companyId),
++              sql`${agentWakeupRequests.payload}->>'issueId' = ${scope.issueId}`)
++          : lte(agentWakeupRequests.updatedAt, cadence),
++      ))
++      .orderBy(asc(agentWakeupRequests.updatedAt), asc(agentWakeupRequests.requestedAt)).limit(50);
++    for (const { wake } of parked) {
++      if (!isDeferredExecutionOwnershipWait(wake.payload)) continue;
++      if (!scope) {
++        // Advance the cursor so one damaged receipt cannot starve later ones
++        // and concurrent sweeps do not revisit the same receipt.
++        const [claimed] = await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
++          eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
++          deferredExecutionOwnershipWaitPredicate(), lte(agentWakeupRequests.updatedAt, cadence),
++        )).returning({ id: agentWakeupRequests.id });
++        if (!claimed) continue;
++      }
++      await resumeExecutionOwnershipWait(wake).catch((err) => {
++        logger.warn({ err, wakeId: wake.id }, "failed to resume a wake parked behind an execution ownership hold");
++      });
++    }
++  }
++
++  async function nextExecutionOwnershipWaitAt(): Promise<number | null> {
++    // Keep the obligation while its company is paused too: activation need not
++    // manufacture another receipt. Completed/dedicated receipts schedule nothing.
++    const [pending] = await db.select({ updatedAt: agentWakeupRequests.updatedAt })
++      .from(agentWakeupRequests).where(deferredExecutionOwnershipWaitPredicate())
++      .orderBy(asc(agentWakeupRequests.updatedAt)).limit(1);
++    return pending ? Math.max(Date.now(), pending.updatedAt.getTime() + 30_000) : null;
++  }
++
+   async function releaseIssueExecutionAndPromote(
+     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
+     options: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] } = {},
+@@ -1731,6 +1860,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
+     resumeRemoteStopComments,
+     cancelRunInternal,
+     resumeExecutionWaitComments,
++    resumeExecutionOwnershipWaits,
++    nextExecutionOwnershipWaitAt,
+     resumeQueuedCommentInterrupt,
+     resumeSavedLegacyComments: resumeSavedComments,
+     resumeTaskRetry,
+diff --git a/server/src/services/heartbeat/run-preparation.ts b/server/src/services/heartbeat/run-preparation.ts
+index 2b8c3f5f70..eb84c93c1c 100644
+--- a/server/src/services/heartbeat/run-preparation.ts
++++ b/server/src/services/heartbeat/run-preparation.ts
+@@ -835,6 +835,10 @@ export interface WakeupOptions {
+   queuedCommentInterruptId?: string;
+   /** Internal delivery of an existing undelivered user comment. */
+   queuedCommentRequestId?: string;
++  /** Internal resume of a wake parked behind a released execution ownership hold. */
++  executionWaitResumeId?: string;
++  /** Exact server-read receipt payload; admission rejects a concurrent merge. */
++  executionWaitResumePayload?: Record<string, unknown>;
+   /** Internal delivery of the authenticated task-level Retry receipt. */
+   taskRetryRequestId?: string;
+   /** Exact failed run selected by an authenticated board Retry request. */
+@@ -1768,7 +1772,7 @@ export function enrichWakeContextSnapshot(input: {
+   };
+ }
+ 
+-const INTERACTION_CONTINUATION_CONTEXT_KEYS = [
++export const INTERACTION_CONTINUATION_CONTEXT_KEYS = [
+   "interactionId",
+   "interactionKind",
+   "interactionStatus",

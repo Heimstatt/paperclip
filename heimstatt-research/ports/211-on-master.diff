@@ -1,0 +1,263 @@
+diff --git a/server/src/__tests__/heartbeat-released-execution-wake.test.ts b/server/src/__tests__/heartbeat-released-execution-wake.test.ts
+new file mode 100644
+index 0000000000..2693fc8f18
+--- /dev/null
++++ b/server/src/__tests__/heartbeat-released-execution-wake.test.ts
+@@ -0,0 +1,96 @@
++import { randomUUID } from "node:crypto";
++import { and, eq, sql } from "drizzle-orm";
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { agentWakeupRequests, authUsers, createDb, environmentLeases, heartbeatRuns, issues, type Db } from "@paperclipai/db";
++import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
++import { seedReviewerIntent } from "./helpers/reviewer-intent.js";
++import { heartbeatService } from "../services/heartbeat.js";
++import { selectReleasedExecutionWake } from "../services/heartbeat/released-execution-wake.js";
++
++const support = await getEmbeddedPostgresTestSupport();
++(support.supported ? describe : describe.skip)("wake skipped during executor cleanup", () => {
++  let fixture: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
++  let db: Db;
++  beforeAll(async () => {
++    fixture = await startEmbeddedPostgresTestDatabase("released-execution-wake-");
++    db = createDb(fixture.connectionString);
++    await db.insert(authUsers).values({ id: "board", name: "Sponsor", email: "release@example.test", createdAt: new Date(), updatedAt: new Date() });
++  }, 90_000);
++  beforeEach(async () => { await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
++  afterAll(async () => { await db?.$client.end(); await fixture?.cleanup(); });
++
++  // The author's run moved the task to review and was cancelled by that handoff.
++  // Its environment lease is still held when the reviewer's wake is checked.
++  async function seed() {
++    const f = await seedReviewerIntent(db, false, undefined, false);
++    await db.update(heartbeatRuns).set({ runtimeMode: "legacy",
++      runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } } }).where(eq(heartbeatRuns.id, f.source.id));
++    const [lease] = await db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.source.id,
++      provider: "local", status: "active" }).returning();
++    // Keep the reviewer busy so admission queues its run instead of launching a provider.
++    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
++    const state = f.issue.executionState as Record<string, unknown>;
++    const executionStage = { stageId: state.currentStageId, stageType: "review", wakeRole: "reviewer",
++      currentParticipant: state.currentParticipant, returnAssignee: state.returnAssignee,
++      reviewRequest: state.reviewRequest, lastDecisionOutcome: null, allowedActions: ["approve", "request_changes"] };
++    const reviewWake = {
++      source: "assignment" as const, triggerDetail: "system" as const, reason: "execution_review_requested",
++      payload: { issueId: f.issueId, mutation: "update", executionStage, interruptedRunId: f.source.id },
++      requestedByActorType: "agent" as const, requestedByActorId: f.source.agentId,
++      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "execution_review_requested",
++        source: "issue.execution_stage", executionStage, interruptedRunId: f.source.id },
++    };
++    return { ...f, lease, reviewWake };
++  }
++  type Fixture = Awaited<ReturnType<typeof seed>>;
++  const release = (f: Fixture) => db.update(environmentLeases)
++    .set({ status: "released", releasedAt: new Date(), cleanupStatus: "succeeded" }).where(eq(environmentLeases.id, f.lease.id));
++  const skipped = (f: Fixture) => db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.agentId),
++    eq(agentWakeupRequests.status, "skipped"), eq(agentWakeupRequests.reason, "execution_reconciliation_required")));
++  const reviewerRuns = (f: Fixture) => db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, f.agentId),
++    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`));
++  const select = (f: Fixture) => selectReleasedExecutionWake(db, { companyId: f.companyId, issueId: f.issueId, releasedRunId: f.source.id });
++
++  it("delivers the skipped review wake once when the author's executor releases the task", async () => {
++    const f = await seed();
++    const service = heartbeatService(db);
++
++    await service.wakeup(f.agentId, f.reviewWake);
++    expect(await skipped(f)).toHaveLength(1);
++    expect(await reviewerRuns(f)).toHaveLength(0);
++
++    await release(f);
++    const resume = await select(f);
++    expect(resume).toMatchObject({ agentId: f.agentId, opts: {
++      source: "assignment", reason: "execution_review_requested",
++      payload: { issueId: f.issueId, executionStage: { stageId: f.reviewWake.payload.executionStage.stageId } },
++      contextSnapshot: { source: "issue.execution_stage", wakeReason: "execution_review_requested" },
++    } });
++    expect(resume!.opts.payload).not.toHaveProperty("executionWait");
++    await service.wakeup(resume!.agentId, resume!.opts);
++
++    expect(await reviewerRuns(f)).toMatchObject([{ status: "queued",
++      contextSnapshot: { wakeReason: "execution_review_requested", source: "issue.execution_stage" } }]);
++    // The same release recorded again does not deliver a second wake.
++    expect(await select(f)).toBeNull();
++  }, 60_000);
++
++  it("does not deliver a skipped wake that the task no longer needs", async () => {
++    const f = await seed();
++    await heartbeatService(db).wakeup(f.agentId, f.reviewWake);
++    await release(f);
++    expect(await select(f)).not.toBeNull();
++
++    const state = f.issue.executionState as Record<string, unknown>;
++    await db.update(issues).set({ executionState: { ...state, currentStageId: randomUUID() } }).where(eq(issues.id, f.issueId));
++    expect(await select(f)).toBeNull();
++
++    await db.update(issues).set({ executionState: state, status: "done" }).where(eq(issues.id, f.issueId));
++    expect(await select(f)).toBeNull();
++
++    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, f.issueId));
++    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "assignment",
++      reason: "execution_review_requested", status: "queued", payload: { issueId: f.issueId } });
++    expect(await select(f)).toBeNull();
++  }, 60_000);
++});
+diff --git a/server/src/__tests__/helpers/reviewer-intent.ts b/server/src/__tests__/helpers/reviewer-intent.ts
+new file mode 100644
+index 0000000000..6b58bff20e
+--- /dev/null
++++ b/server/src/__tests__/helpers/reviewer-intent.ts
+@@ -0,0 +1,28 @@
++import { randomUUID } from "node:crypto";
++import { agents, companies, companyMemberships, heartbeatRuns, issues, type Db } from "@paperclipai/db";
++
++// Master port of the fork helper: only the unreleased, no-intent shape the
++// released-execution-wake test uses. The fork-only release record and
++// reviewer-intent receipt are not available on master.
++export async function seedReviewerIntent(db: Db, _produce = false, limit?: null | number, _released = false) {
++    const companyId = randomUUID(), agentId = randomUUID(), authorId = randomUUID(), issueId = randomUUID(), stageId = randomUUID();
++    await db.insert(companies).values({ id: companyId, name: "Consumer fixture", issuePrefix: "C" + companyId.slice(0, 7), defaultResponsibleUserId: "board" });
++    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board",
++      membershipRole: "operator", status: "active" });
++    await db.insert(agents).values([
++      { id: agentId, companyId, name: "Reviewer", role: "engineer", status: "idle", adapterType: "process", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } },
++      { id: authorId, companyId, name: "Author", role: "engineer", status: "idle", adapterType: "process", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } },
++    ]);
++    const [issue] = await db.insert(issues).values({ id: issueId, companyId, title: "Pending review", status: "in_review",
++      responsibleUserId: "board", assigneeAgentId: agentId,
++      executionPolicy: { mode: "normal", commentRequired: true, ...(limit === undefined ? {} : { maxReviewRounds: limit }), stages: [{ id: stageId, type: "review", approvalsNeeded: 1,
++        participants: [{ id: randomUUID(), type: "agent", agentId }] }] },
++      executionState: { status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
++        currentParticipant: { type: "agent", agentId }, returnAssignee: { type: "agent", agentId: authorId },
++        completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null, changesRequestedCount: 2,
++        reviewRequest: { instructions: "Review the same submission" } } }).returning();
++    const [source] = await db.insert(heartbeatRuns).values({ companyId, agentId: authorId, status: "cancelled",
++      errorCode: "issue_reassigned", finishedAt: new Date(), responsibleUserId: "board", contextSnapshot: { issueId },
++      resultJson: { executionCancellation: { state: "acknowledged" }, reassignmentStopConfirmed: true } }).returning();
++    return { companyId, agentId, issueId, source, issue, };
++  }
+diff --git a/server/src/services/heartbeat.ts b/server/src/services/heartbeat.ts
+index de0f082c8e..4a07d4c1a7 100644
+--- a/server/src/services/heartbeat.ts
++++ b/server/src/services/heartbeat.ts
+@@ -17,6 +17,7 @@ import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
+ import { promptInjectionPreventionService } from "./prompt-injection-prevention.js";
+ import { createHeartbeatAgentStatus } from "./heartbeat/agent-status.js";
+ import { heartbeatExternalProvider, nativeRuntimeHasInstructionFilesystem } from "./heartbeat/external-provider.js";
++import { selectReleasedExecutionWake } from "./heartbeat/released-execution-wake.js";
+ import { pendingCaseHandoffForRun, recordCaseHandoffExecutionReleased, recordLegacyCaseHandoffCleanupIntent, recordLegacyCaseHandoffCleanupVerified } from "./heartbeat/case-handoff-lifecycle.js";
+ import { hasStoppedLocalProcessTree, legacyAdapterNeedsLocalProcessSettlement } from "./heartbeat/process-settlement.js";
+ import { dotRunnerBroker } from "./dot-runner-broker.js";
+@@ -3938,6 +3939,13 @@ export function heartbeatService(
+       }
+       if (caseHandoffCleanupSettled && latestRun && !nativeSessionResumeScheduled && !nativeWorkspaceFinalizeScheduled &&
+           !nativeOwnershipHeld && isHeartbeatRunTerminalStatus(latestRun.status)) {
++        const releasedIssueId = readNonEmptyString(latestRun.contextSnapshot?.issueId);
++        if (releasedIssueId) {
++          // A wake skipped while this executor held the task continues now, once.
++          await selectReleasedExecutionWake(db, { companyId: latestRun.companyId, issueId: releasedIssueId, releasedRunId: run.id })
++            .then(resume => resume && enqueueWakeup(resume.agentId, resume.opts))
++            .catch(error => logger.warn({ err: error, runId: run.id }, "Could not continue a wake skipped during execution cleanup"));
++        }
+         const handoff = await pendingCaseHandoffForRun(db, run.id);
+         if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);
+       }
+diff --git a/server/src/services/heartbeat/released-execution-wake.ts b/server/src/services/heartbeat/released-execution-wake.ts
+new file mode 100644
+index 0000000000..e594e7e670
+--- /dev/null
++++ b/server/src/services/heartbeat/released-execution-wake.ts
+@@ -0,0 +1,95 @@
++import { and, desc, eq, gte, inArray, or, sql } from "drizzle-orm";
++import { agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
++import { parseIssueExecutionState } from "../issue-execution-policy.js";
++import type { WakeupOptions } from "./run-preparation.js";
++
++const SKIP_REASON = "execution_reconciliation_required";
++const WAKE_CONTEXT_KEY = "_paperclipWakeContext";
++const LIVE_WAKE_STATUSES = ["queued", "claimed", "deferred_issue_execution"];
++
++function record(value: unknown): Record<string, unknown> | null {
++  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
++}
++
++/**
++ * The wake that an executor's release should hand on, if any.
++ *
++ * An assignment wake that arrives while the previous executor of the same task
++ * still holds its environment lease is recorded as skipped. The usual case is a
++ * review handoff: the author's own run moves the task to review, the handoff
++ * cancels that run, and the reviewer's wake is checked before the cancelled
++ * run releases its lease. This selects the newest such skipped wake for the
++ * task's current assignee, so the release event can deliver it once. It
++ * returns null when the wake is stale (other assignee, other review stage or
++ * participant, closed task) or when the assignee already has a newer run or a
++ * live wake for the task.
++ */
++export async function selectReleasedExecutionWake(
++  db: Db,
++  input: { companyId: string; issueId: string; releasedRunId: string },
++): Promise<{ agentId: string; opts: WakeupOptions } | null> {
++  // Wake admission locks the task row before it checks the executor and records
++  // a skip. Taking the same lock here orders this read after any such skip.
++  return db.transaction(async (transaction) => select(transaction as unknown as Db, input));
++}
++
++async function select(
++  db: Db,
++  input: { companyId: string; issueId: string; releasedRunId: string },
++): Promise<{ agentId: string; opts: WakeupOptions } | null> {
++  const [issue] = await db.select().from(issues)
++    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("update");
++  if (!issue?.assigneeAgentId || issue.assigneeUserId || ["done", "cancelled"].includes(issue.status)) return null;
++  const agentId = issue.assigneeAgentId;
++
++  const [skipped] = await db.select().from(agentWakeupRequests).where(and(
++    eq(agentWakeupRequests.companyId, input.companyId),
++    eq(agentWakeupRequests.agentId, agentId),
++    eq(agentWakeupRequests.status, "skipped"),
++    eq(agentWakeupRequests.reason, SKIP_REASON),
++    sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
++  )).orderBy(desc(agentWakeupRequests.createdAt), desc(agentWakeupRequests.id)).limit(1);
++  if (!skipped) return null;
++
++  const payload = record(skipped.payload) ?? {};
++  const context = record(payload[WAKE_CONTEXT_KEY]);
++  const stage = record(payload.executionStage);
++  if (stage) {
++    const state = parseIssueExecutionState(issue.executionState);
++    const participant = state?.currentParticipant;
++    if (state?.status !== "pending" || state.currentStageId !== stage.stageId ||
++        participant?.type !== "agent" || participant.agentId !== agentId) return null;
++  }
++
++  const [newerRun] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
++    eq(heartbeatRuns.companyId, input.companyId),
++    eq(heartbeatRuns.agentId, agentId),
++    or(eq(heartbeatRuns.issueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
++    gte(heartbeatRuns.createdAt, skipped.createdAt),
++  )).limit(1);
++  if (newerRun) return null;
++  const [liveWake] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
++    eq(agentWakeupRequests.companyId, input.companyId),
++    eq(agentWakeupRequests.agentId, agentId),
++    inArray(agentWakeupRequests.status, LIVE_WAKE_STATUSES),
++    sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
++  )).limit(1);
++  if (liveWake) return null;
++
++  const { executionWait: _wait, [WAKE_CONTEXT_KEY]: _context, ...originalPayload } = payload;
++  const contextSnapshot = context ? (({ wakeSource: _s, wakeTriggerDetail: _t, taskKey: _k, ...rest }) => rest)(context) : undefined;
++  return {
++    agentId,
++    opts: {
++      source: skipped.source as WakeupOptions["source"],
++      triggerDetail: (skipped.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
++      reason: typeof context?.wakeReason === "string" ? context.wakeReason : null,
++      payload: originalPayload,
++      ...(contextSnapshot ? { contextSnapshot } : {}),
++      requestedByActorType: (skipped.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
++      requestedByActorId: skipped.requestedByActorId,
++      // One delivery per skipped wake per release, even if the release is recorded twice.
++      idempotencyKey: `execution-release:${input.releasedRunId}:${skipped.id}`,
++    },
++  };
++}
