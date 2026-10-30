@@ -139,6 +139,8 @@ const {
     registerCapturedInstructionCommitWork: vi.fn((_coordinator: unknown, _canRun: () => boolean) => ({ ready: Promise.resolve() })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
+    resumeExecutionOwnershipWaits: vi.fn(async () => undefined),
+    nextExecutionOwnershipWaitAt: vi.fn(async () => null),
     recoverPendingSessionGoalActions: vi.fn(async () => ({ scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0 })),
     recoverActiveSessionGoals: vi.fn(async () => ({ scanned: 0, enqueued: 0 })),
     reconcileStrandedAssignedIssues: vi.fn(async () => ({
