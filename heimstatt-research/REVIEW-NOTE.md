@@ -12,9 +12,11 @@ found.
 ## What we tested
 
 We ported the PR head (`3803bcb898`) onto `master` at `f5e5b05a33` and ran nine outcome cases against the
-PR's own entry points (executor cleanup and the shared delivery-work worker). Each case seeds an issue whose
-previous run was cancelled by the handoff while its environment lease is still active, sends the new
-participant's wake, and checks how many runs the new participant gets.
+resume service. Each case seeds an issue whose previous run was cancelled by the handoff while its
+environment lease is still active, sends the new participant's wake, and checks how many runs the new
+participant gets. The cases call `resumeExecutionOwnershipWaits` directly, at the moments where the
+executor cleanup or a worker pass would call it. So they cover the resume behaviour, not the wiring of
+the cleanup hook or the worker dispatch.
 
 | Case | Expectation | Result |
 |---|---|---|
@@ -28,10 +30,11 @@ participant's wake, and checks how many runs the new participant gets.
 | L1 cleanup hook missed, worker pass after 30 minutes | one run | pass |
 | L2 cleanup hook missed, worker pass after 24 hours | one run | pass |
 
-All nine pass. The PR's own `heartbeat-execution-ownership-wait.test.ts` (25 tests) also passes on the
-port, apart from the timing issue described below. We found no regressions in the 17 existing test files
-that cover `execution_owner_active` or `execution_reconciliation_required` (same results as `master`,
-test for test).
+All nine pass. The wiring itself is covered by the PR's own tests: `heartbeat-execution-ownership-wait.test.ts`
+(25 tests) also passes on the port, apart from the timing issue described below. In an earlier round on
+the same port tree, we found no regressions in the 17 existing test files that cover `execution_owner_active`
+or `execution_reconciliation_required` (same results as `master`, test for test). We did not repeat that
+run for this note.
 
 ## Two conflicts resolved by hand on master
 
@@ -73,6 +76,9 @@ The failed pass is retried `retryMs` later in fake time, which the 5 s real-time
 We think the reconnect happens because the pool's idle timer (60 s by default, also armed through the faked
 `setTimeout`) closes connections during the 90 s advance in `quiet()`. That part follows from the timing; we
 did not log it directly.
+
+One limit: in one of the 30 whole-file runs on our port, a second test failed as well. We did not record
+which one, so that failure is unclassified. In the 90 runs with the change below, no test failed.
 
 Two other changes did not help: a 20 s `waitFor` timeout still failed 2/30, and advancing in 1 s steps
 failed 2 of 8 runs.
