@@ -1,0 +1,16 @@
+diff --git a/server/src/__tests__/heartbeat-execution-ownership-wait.test.ts b/server/src/__tests__/heartbeat-execution-ownership-wait.test.ts
+index 96065286..ec5fcbd1 100644
+--- a/server/src/__tests__/heartbeat-execution-ownership-wait.test.ts
++++ b/server/src/__tests__/heartbeat-execution-ownership-wait.test.ts
+@@ -19,7 +19,10 @@ const support = await getEmbeddedPostgresTestSupport();
+   let db: ReturnType<typeof createDb>;
+   beforeAll(async () => {
+     database = await startEmbeddedPostgresTestDatabase("execution-ownership-wait-");
+-    db = createDb(database.connectionString);
++    // The shared-worker tests fake setTimeout. postgres.js idle and connect
++    // timers would then fire on advanced fake time and drop a worker query
++    // (CONNECT_TIMEOUT). Disable both driver timers for this test client.
++    db = createDb(database.connectionString, { idleTimeoutSeconds: 0, connectTimeoutSeconds: 0 });
+   }, 90_000);
+   afterAll(async () => { await database?.cleanup(); });
+ 

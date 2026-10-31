@@ -54,9 +54,34 @@ The rest of the port was mechanical (an additive entry in the delivery queue lis
 ## Timing-sensitive test
 
 "shared ownership-wait worker › observes nested admission only after outer settlement (rollback=false)"
-failed intermittently in our runs: `settle()` waits up to 5 seconds for `idleWorkSnapshot().active` to
-reach 0, and in a failing run the admitted successor run was still tracked as active when that wait ended
-(`active === 1`). See the counts and the proposed adjustment in the accompanying report section
-"Flaky test"; we did not change the test.
+fails intermittently, on the unmodified PR head as well as on our port. Each figure below is from 30 runs
+as a non-root user:
 
-<!-- FLAKY-DETAIL -->
+| Code | Test alone | Whole test file |
+|---|---|---|
+| PR head `3803bcb898` | 4/30 failed | 4/30 failed |
+| Our port on `master` | 2/30 failed | 6/30 failed |
+| PR head with the change below | 0/30 | 0/30 |
+| Our port with the change below | – | 0/30 |
+
+**Cause.** `settle()` waits up to 5 s for `idleWorkSnapshot().active` to reach 0, and in a failing run it
+stays at 1. With instrumentation, the open token is the delivery coordinator's `finishIntent`. The worker
+pass that should release it fails with `CONNECT_TIMEOUT` from postgres.js. The test fakes `setTimeout`, and
+postgres.js arms its connect timer (30 s) through that faked `setTimeout`, so
+`vi.advanceTimersByTimeAsync(30_000)` can fire the timer while a worker pass is still opening a connection.
+The failed pass is retried `retryMs` later in fake time, which the 5 s real-time `waitFor` never reaches.
+We think the reconnect happens because the pool's idle timer (60 s by default, also armed through the faked
+`setTimeout`) closes connections during the 90 s advance in `quiet()`. That part follows from the timing; we
+did not log it directly.
+
+Two other changes did not help: a 20 s `waitFor` timeout still failed 2/30, and advancing in 1 s steps
+failed 2 of 8 runs.
+
+**Suggested change (test only, no product code):** disable the driver timers for this file's client:
+
+```ts
+db = createDb(database.connectionString, { idleTimeoutSeconds: 0, connectTimeoutSeconds: 0 });
+```
+
+In postgres.js, a value of `0` turns both timers off. No product code changes. This is only a suggestion;
+we have not changed the test in the PR.
