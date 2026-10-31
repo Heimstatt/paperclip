@@ -50,6 +50,7 @@ export const DELIVERY_QUEUES = {
   secretProposalExpiry: "secret-proposal-expiry",
   customImageExpiry: "custom-image-expiry",
   historicalCleanup: "historical-cleanup",
+  executionOwnershipWaits: "execution-ownership-waits",
   adapterLoginCleanup: "adapter-login-cleanup",
   setupTokenCleanup: "setup-token-cleanup",
   localLoginCleanup: "local-login-cleanup",

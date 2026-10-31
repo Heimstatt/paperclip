@@ -1909,6 +1909,68 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
+  it("re-admits a handoff wake parked behind the stopped run's lease once executor cleanup releases it", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const [reviewer] = await db.insert(agents).values({ companyId, name: "Reviewer", role: "engineer", adapterType: "codex_local",
+      status: "idle", adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {} }).returning();
+    // Occupy the reviewer so admission queues its run without launching a provider.
+    const [busy] = await db.insert(heartbeatRuns).values({ companyId, agentId: reviewer!.id, status: "running", contextSnapshot: {} }).returning();
+    const identity = { id: randomUUID(), companyId, issueId, heartbeatRunId: runId, provider: "local" };
+    let openRelease!: () => void;
+    const releaseGate = new Promise<void>(resolve => { openRelease = resolve; });
+    const originalFactory = environmentOrchestrator.environmentRunOrchestrator;
+    const release = vi.fn(async () => {
+      await releaseGate;
+      // The executor's own local lease and the fixture lease release together.
+      await db.update(environmentLeases).set({ status: "expired", releasedAt: new Date() })
+        .where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId)));
+      return { released: [], errors: [] };
+    });
+    const factory = vi.spyOn(environmentOrchestrator, "environmentRunOrchestrator").mockImplementation((...args) => ({
+      ...originalFactory(...args), releaseForRun: release,
+    }));
+    const heartbeat = heartbeatService(db);
+    let cancellation: ReturnType<typeof heartbeat.cancelRun> | undefined;
+    mockAdapterExecute.mockImplementationOnce(async (input?: unknown) => {
+      const invocation = input as { onCancellationReady: () => Promise<void>; onDispatch: () => void };
+      await invocation.onCancellationReady();
+      invocation.onDispatch();
+      await db.insert(environmentLeases).values({ ...identity, status: "active", leasePolicy: "ephemeral" });
+      // The handoff stops the author's run; its lease stays held until cleanup.
+      cancellation = heartbeat.cancelRun(runId, "Cancelled before issue reassignment",
+        { errorCode: "issue_reassigned", resultJson: { reassignmentStopConfirmed: true } });
+      void cancellation.catch(() => undefined);
+      await waitForValue(async () => adapterExecutionControls.get(runId)?.controller.signal.aborted);
+      return { exitCode: 1, signal: "SIGTERM", timedOut: false, errorMessage: "Stopped", errorCode: "cancelled",
+        resultJson: { executionCancellation: { state: "acknowledged" } }, summary: "Stopped turn", provider: "test", model: "test-model" };
+    });
+    try {
+      await heartbeat.resumeQueuedRuns();
+      // The run is terminal and its lock released while its executor still waits on the lease release.
+      await waitForValue(async () => release.mock.calls.length > 0 || null);
+      await waitForValue(async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status === "cancelled" || null);
+      await waitForValue(async () => (await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.executionRunId === null || null);
+      await db.update(issues).set({ assigneeAgentId: reviewer!.id }).where(eq(issues.id, issueId));
+      expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ runId, cause: "execution_owner_active" });
+      expect(await heartbeat.wakeup(reviewer!.id, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+        payload: { issueId, mutation: "update", interruptedRunId: runId }, requestedByActorType: "agent", requestedByActorId: agentId,
+        contextSnapshot: { issueId, source: "issue.update", interruptedRunId: runId } })).toBeNull();
+      const [parked] = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, reviewer!.id)));
+      expect(parked).toMatchObject({ status: "deferred_issue_execution", payload: { executionWait: { cause: "execution_owner_active", runId } } });
+      openRelease();
+      await heartbeat.drainActiveRunExecutions();
+      expect((await cancellation)?.status).toBe("cancelled");
+      const reviewerRuns = (await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, reviewer!.id)))).filter(run => run.id !== busy!.id);
+      expect(reviewerRuns).toHaveLength(1);
+      expect(reviewerRuns[0]).toMatchObject({ status: "queued",
+        contextSnapshot: expect.objectContaining({ issueId, wakeReason: "issue_assigned", interruptedRunId: runId }) });
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, parked!.id)))[0])
+        .toMatchObject({ status: "coalesced", runId: reviewerRuns[0]!.id });
+    } finally { factory.mockRestore(); }
+  });
+
   it("does not reuse a completed explicit turn's receipt for a missing-comment follow-up", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const sourceRunId = randomUUID(), commentId = randomUUID();
