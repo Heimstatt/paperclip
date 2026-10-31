@@ -5,6 +5,7 @@ import {
   agentWakeupRequests, agents, companies, createDb, environmentLeases, heartbeatRuns, issueRecoveryActions, issues,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "../__tests__/helpers/embedded-postgres.js";
+import { issueExecutionStateSchema } from "@paperclipai/shared";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { heartbeatService } from "./heartbeat.js";
 
@@ -89,16 +90,22 @@ const support = await getEmbeddedPostgresTestSupport();
   async function seedStage(opts: { stateMatches: boolean }) {
     const f = await seed();
     const stageId = randomUUID();
-    await db.update(issues).set({
-      status: "in_review",
-      executionState: {
-        status: "pending",
-        currentStageId: opts.stateMatches ? stageId : randomUUID(),
-        currentStageType: "review",
-        currentParticipant: { type: "agent", agentId: f.ownerId, userId: null },
-        returnAssignee: { type: "agent", agentId: f.outgoingId, userId: null },
-      },
-    }).where(eq(issues.id, f.issueId));
+    // Every executionState written here must be one the server could write:
+    // parse it with the shared schema so the fixture cannot drift again.
+    const executionState = issueExecutionStateSchema.parse({
+      status: "pending",
+      currentStageId: opts.stateMatches ? stageId : randomUUID(),
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: f.ownerId, userId: null },
+      returnAssignee: { type: "agent", agentId: f.outgoingId, userId: null },
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      changesRequestedCount: 0,
+    });
+    await db.update(issues).set({ status: "in_review", executionState }).where(eq(issues.id, f.issueId));
     const executionStage = {
       stageId, wakeRole: "reviewer", stageType: "review", reviewRequest: null,
       allowedActions: ["approve", "request_changes"],
